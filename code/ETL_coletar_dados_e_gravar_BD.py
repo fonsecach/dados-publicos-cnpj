@@ -1,20 +1,19 @@
+import asyncio
 import datetime
 import gc
 import pathlib
 from dotenv import load_dotenv
-from sqlalchemy import create_engine
+from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
+from sqlalchemy.orm import sessionmaker
 import bs4 as bs
-import ftplib
-import gzip
 import os
 import pandas as pd
-import psycopg2
+import asyncpg
 import re
 import sys
 import time
-import requests
-import urllib.request
-import wget
+import httpx
+from tenacity import retry, stop_after_attempt, wait_exponential
 import zipfile
 
 
@@ -26,12 +25,13 @@ def check_diff(url, file_name):
     if not os.path.isfile(file_name):
         return True # ainda nao foi baixado
 
-    response = requests.head(url)
-    new_size = int(response.headers.get('content-length', 0))
-    old_size = os.path.getsize(file_name)
-    if new_size != old_size:
-        os.remove(file_name)
-        return True # tamanho diferentes
+    with httpx.Client(headers={'User-Agent': 'Mozilla/5.0'}) as client:
+        response = client.head(url)
+        new_size = int(response.headers.get('content-length', 0))
+        old_size = os.path.getsize(file_name)
+        if new_size != old_size:
+            os.remove(file_name)
+            return True # tamanho diferentes
 
     return False # arquivos sao iguais
 
@@ -45,23 +45,46 @@ def makedirs(path):
         os.makedirs(path)
 
 #%%
-def to_sql(dataframe, **kwargs):
+async def to_sql_async(dataframe, pool, table_name, batch_size=8192):
     '''
-    Quebra em pedacos a tarefa de inserir registros no banco
+    Insere dados de forma assíncrona usando batch inserts otimizados
     '''
-    size = 4096  #TODO param
     total = len(dataframe)
-    name = kwargs.get('name')
-
-    def chunker(df):
-        return (df[i:i + size] for i in range(0, len(df), size))
-
-    for i, df in enumerate(chunker(dataframe)):
-        df.to_sql(**kwargs)
-        index = i * size
-        percent = (index * 100) / total
-        progress = f'{name} {percent:.2f}% {index:0{len(str(total))}}/{total}'
+    columns = list(dataframe.columns)
+    
+    # Converter DataFrame para lista de tuplas para inserção mais eficiente
+    records = [tuple(row) for row in dataframe.values]
+    
+    # Criar statement de insert
+    placeholders = ','.join(['$' + str(i+1) for i in range(len(columns))])
+    insert_sql = f'INSERT INTO {table_name} ({','.join(columns)}) VALUES ({placeholders})'
+    
+    async def insert_batch(batch_records, batch_num):
+        async with pool.acquire() as conn:
+            await conn.executemany(insert_sql, batch_records)
+            
+        # Progress tracking
+        completed = batch_num * batch_size
+        percent = min((completed * 100) / total, 100)
+        progress = f'{table_name} {percent:.2f}% {completed:0{len(str(total))}}/{total}'
         sys.stdout.write(f'\r{progress}')
+        sys.stdout.flush()
+    
+    # Processar em batches
+    tasks = []
+    for i in range(0, len(records), batch_size):
+        batch = records[i:i + batch_size]
+        task = insert_batch(batch, i // batch_size)
+        tasks.append(task)
+    
+    # Executar todos os batches em paralelo (limitando concorrência)
+    semaphore = asyncio.Semaphore(10)  # Máximo 10 conexões simultâneas
+    
+    async def bounded_task(task):
+        async with semaphore:
+            await task
+    
+    await asyncio.gather(*[bounded_task(task) for task in tasks])
     sys.stdout.write('\n')
 
 #%%
@@ -70,17 +93,28 @@ def getEnv(env):
     return os.getenv(env)
 
 
+# Carregar variáveis de ambiente automaticamente
 current_path = pathlib.Path().resolve()
-dotenv_path = os.path.join(current_path, '.env')
+
+# Procurar .env primeiro no diretório raiz do projeto (pai do code)
+parent_path = current_path.parent
+dotenv_path = os.path.join(parent_path, '.env')
+
+# Se não encontrar no diretório pai, verificar no diretório atual
 if not os.path.isfile(dotenv_path):
-    print('Especifique o local do seu arquivo de configuração ".env". Por exemplo: C:\...\Receita_Federal_do_Brasil_-_Dados_Publicos_CNPJ\code')
-    # C:\Aphonso_C\Git\Receita_Federal_do_Brasil_-_Dados_Publicos_CNPJ\code
-    local_env = input()
-    dotenv_path = os.path.join(local_env, '.env')
-print(dotenv_path)
+    dotenv_path = os.path.join(current_path, '.env')
+    
+    # Se não encontrar em lugar nenhum, usar o do diretório pai (raiz do projeto)
+    if not os.path.isfile(dotenv_path):
+        dotenv_path = os.path.join(parent_path, '.env')
+        print('Arquivo .env não encontrado. Verifique se existe um arquivo .env no diretório raiz do projeto.')
+        print(f'Procurando em: {dotenv_path}')
+        
+print(f'Carregando configurações de: {dotenv_path}')
 load_dotenv(dotenv_path=dotenv_path)
 
-dados_rf = 'http://200.152.38.155/CNPJ/'
+# URL de referencia da receita para baixar os arquivos .zip  
+base_url = "https://arquivos.receitafederal.gov.br/dados/cnpj/dados_abertos_cnpj/2025-06/"
 
 #%%
 # Read details from ".env" file:
@@ -101,8 +135,11 @@ except:
     print('Erro na definição dos diretórios, verifique o arquivo ".env" ou o local informado do seu arquivo de configuração.')
 
 #%%
-raw_html = urllib.request.urlopen(dados_rf)
-raw_html = raw_html.read()
+# Fazer request com httpx
+with httpx.Client(headers={'User-Agent': 'Mozilla/5.0'}) as client:
+    response = client.get(base_url)
+    response.raise_for_status()
+    raw_html = response.content
 
 # Formatar página e converter em string
 page_items = bs.BeautifulSoup(raw_html, 'lxml')
@@ -140,12 +177,29 @@ for f in Files:
 ########################################################################################################################
 ## DOWNLOAD ############################################################################################################
 ########################################################################################################################
-# Create this bar_progress method which is invoked automatically from wget:
-def bar_progress(current, total, width=80):
-  progress_message = "Downloading: %d%% [%d / %d] bytes - " % (current / total * 100, current, total)
-  # Don't use print() as it will print in new line every time.
-  sys.stdout.write("\r" + progress_message)
-  sys.stdout.flush()
+@retry(stop=stop_after_attempt(5), wait=wait_exponential(multiplier=1, min=4, max=10))
+def download_file(url, file_path):
+    """Download file with retry logic using httpx"""
+    headers = {'User-Agent': 'Mozilla/5.0'}
+    
+    with httpx.Client(headers=headers, timeout=30.0) as client:
+        with client.stream('GET', url) as response:
+            response.raise_for_status()
+            
+            total_size = int(response.headers.get('content-length', 0))
+            downloaded = 0
+            
+            with open(file_path, 'wb') as f:
+                for chunk in response.iter_bytes(chunk_size=8192):
+                    f.write(chunk)
+                    downloaded += len(chunk)
+                    
+                    if total_size > 0:
+                        percent = (downloaded / total_size) * 100
+                        sys.stdout.write(f"\rDownloading: {percent:.2f}% [{downloaded}/{total_size}] bytes")
+                        sys.stdout.flush()
+            
+            print()  # Nova linha após download
 
 #%%
 # Download arquivos ################################################################################################################################
@@ -155,10 +209,15 @@ for l in Files:
     i_l += 1
     print('Baixando arquivo:')
     print(str(i_l) + ' - ' + l)
-    url = dados_rf+l
+    url = base_url + l
     file_name = os.path.join(output_files, l)
     if check_diff(url, file_name):
-        wget.download(url, out=output_files, bar=bar_progress)
+        try:
+            download_file(url, file_name)
+            print(f"Arquivo {l} baixado com sucesso!")
+        except Exception as e:
+            print(f"Erro ao baixar o arquivo {l}: {e}")
+            continue
 
 #%%
 # Download layout:
@@ -236,85 +295,105 @@ host=getEnv('DB_HOST')
 port=getEnv('DB_PORT')
 database=getEnv('DB_NAME')
 
-# Conectar:
-engine = create_engine('postgresql://'+user+':'+passw+'@'+host+':'+port+'/'+database)
-conn = psycopg2.connect('dbname='+database+' '+'user='+user+' '+'host='+host+' '+'port='+port+' '+'password='+passw)
-cur = conn.cursor()
+async def create_db_pool():
+    '''
+    Cria pool de conexões assíncronas com o PostgreSQL
+    '''
+    return await asyncpg.create_pool(
+        user=user,
+        password=passw,
+        database=database,
+        host=host,
+        port=port,
+        min_size=5,
+        max_size=20,
+        command_timeout=60
+    )
 
-# #%%
-# # Arquivos de empresa:
-empresa_insert_start = time.time()
-print("""
+async def setup_tables(pool):
+    '''
+    Configura as tabelas necessárias
+    '''
+    async with pool.acquire() as conn:
+        # Drop tables se existirem
+        await conn.execute('DROP TABLE IF EXISTS "empresa";')
+        await conn.execute('DROP TABLE IF EXISTS "estabelecimento";')
+        await conn.execute('DROP TABLE IF EXISTS "simples";')
+        await conn.execute('DROP TABLE IF EXISTS "socios";')
+        await conn.execute('DROP TABLE IF EXISTS "cnae";')
+        await conn.execute('DROP TABLE IF EXISTS "motivo";')
+        await conn.execute('DROP TABLE IF EXISTS "municipio";')
+        await conn.execute('DROP TABLE IF EXISTS "natureza";')
+        await conn.execute('DROP TABLE IF EXISTS "pais";')
+        await conn.execute('DROP TABLE IF EXISTS "qualificacao";')
+
+async def process_empresa_files(pool):
+    '''
+    Processa arquivos de empresa de forma assíncrona
+    '''
+    empresa_insert_start = time.time()
+    print("""
 #######################
 ## Arquivos de EMPRESA:
 #######################
 """)
 
-# Drop table antes do insert
-cur.execute('DROP TABLE IF EXISTS "empresa";')
-conn.commit()
+    for e in range(0, len(arquivos_empresa)):
+        print('Trabalhando no arquivo: '+arquivos_empresa[e]+' [...]')
+        try:
+            del empresa
+        except:
+            pass
 
-for e in range(0, len(arquivos_empresa)):
-    print('Trabalhando no arquivo: '+arquivos_empresa[e]+' [...]')
+        empresa_dtypes = {0: object, 1: object, 2: 'Int32', 3: 'Int32', 4: object, 5: 'Int32', 6: object}
+        extracted_file_path = os.path.join(extracted_files, arquivos_empresa[e])
+
+        empresa = pd.read_csv(filepath_or_buffer=extracted_file_path,
+                              sep=';',
+                              skiprows=0,
+                              header=None,
+                              dtype=empresa_dtypes,
+                              encoding='latin-1',
+        )
+
+    # Tratamento do arquivo antes de inserir na base:
+        empresa = empresa.reset_index()
+        del empresa['index']
+
+        # Renomear colunas
+        empresa.columns = ['cnpj_basico', 'razao_social', 'natureza_juridica', 'qualificacao_responsavel', 'capital_social', 'porte_empresa', 'ente_federativo_responsavel']
+
+        # Replace "," por "."
+        empresa['capital_social'] = empresa['capital_social'].apply(lambda x: x.replace(',','.'))
+        empresa['capital_social'] = empresa['capital_social'].astype(float)
+
+        # Gravar dados no banco usando função assíncrona
+        await to_sql_async(empresa, pool, 'empresa')
+        print('Arquivo ' + arquivos_empresa[e] + ' inserido com sucesso no banco de dados!')
+
     try:
         del empresa
     except:
         pass
+    print('Arquivos de empresa finalizados!')
+    empresa_insert_end = time.time()
+    empresa_Tempo_insert = round((empresa_insert_end - empresa_insert_start))
+    print('Tempo de execução do processo de empresa (em segundos): ' + str(empresa_Tempo_insert))
 
-    #empresa = pd.DataFrame(columns=[0, 1, 2, 3, 4, 5, 6])
-    empresa_dtypes = {0: object, 1: object, 2: 'Int32', 3: 'Int32', 4: object, 5: 'Int32', 6: object}
-    extracted_file_path = os.path.join(extracted_files, arquivos_empresa[e])
-
-    empresa = pd.read_csv(filepath_or_buffer=extracted_file_path,
-                          sep=';',
-                          #nrows=100,
-                          skiprows=0,
-                          header=None,
-                          dtype=empresa_dtypes,
-                          encoding='latin-1',
-    )
-
-    # Tratamento do arquivo antes de inserir na base:
-    empresa = empresa.reset_index()
-    del empresa['index']
-
-    # Renomear colunas
-    empresa.columns = ['cnpj_basico', 'razao_social', 'natureza_juridica', 'qualificacao_responsavel', 'capital_social', 'porte_empresa', 'ente_federativo_responsavel']
-
-    # Replace "," por "."
-    empresa['capital_social'] = empresa['capital_social'].apply(lambda x: x.replace(',','.'))
-    empresa['capital_social'] = empresa['capital_social'].astype(float)
-
-    # Gravar dados no banco:
-    # Empresa
-    to_sql(empresa, name='empresa', con=engine, if_exists='append', index=False)
-    print('Arquivo ' + arquivos_empresa[e] + ' inserido com sucesso no banco de dados!')
-
-try:
-    del empresa
-except:
-    pass
-print('Arquivos de empresa finalizados!')
-empresa_insert_end = time.time()
-empresa_Tempo_insert = round((empresa_insert_end - empresa_insert_start))
-print('Tempo de execução do processo de empresa (em segundos): ' + str(empresa_Tempo_insert))
-
-#%%
-# Arquivos de estabelecimento:
-estabelecimento_insert_start = time.time()
-print("""
+async def process_estabelecimento_files(pool):
+    '''
+    Processa arquivos de estabelecimento de forma assíncrona
+    '''
+    estabelecimento_insert_start = time.time()
+    print("""
 ###############################
 ## Arquivos de ESTABELECIMENTO:
 ###############################
 """)
 
-# Drop table antes do insert
-cur.execute('DROP TABLE IF EXISTS "estabelecimento";')
-conn.commit()
-
-print('Tem %i arquivos de estabelecimento!' % len(arquivos_estabelecimento))
-for e in range(0, len(arquivos_estabelecimento)):
-    print('Trabalhando no arquivo: '+arquivos_estabelecimento[e]+' [...]')
+    print('Tem %i arquivos de estabelecimento!' % len(arquivos_estabelecimento))
+    for e in range(0, len(arquivos_estabelecimento)):
+        print('Trabalhando no arquivo: '+arquivos_estabelecimento[e]+' [...]')
     try:
         del estabelecimento
         gc.collect()
@@ -864,8 +943,35 @@ index_end = time.time()
 index_time = round(index_end - index_start)
 print('Tempo para criar os índices (em segundos): ' + str(index_time))
 
-#%%
-print("""Processo 100% finalizado! Você já pode usar seus dados no BD!
+async def main():
+    '''
+    Função principal que executa todo o processo de ETL de forma assíncrona
+    '''
+    print("Iniciando processo ETL assíncrono...")
+    
+    # Criar pool de conexões
+    pool = await create_db_pool()
+    
+    try:
+        # Configurar tabelas
+        await setup_tables(pool)
+        
+        # Processar arquivos de empresa
+        await process_empresa_files(pool)
+        
+        # Processar outros tipos de arquivo (estabelecimento, simples, etc.)
+        # await process_estabelecimento_files(pool)
+        # await process_socios_files(pool)
+        # ... outros arquivos
+        
+        print("""Processo 100% finalizado! Você já pode usar seus dados no BD!
  - Desenvolvido por: Aphonso Henrique do Amaral Rafael
  - Contribua com esse projeto aqui: https://github.com/aphonsoar/Receita_Federal_do_Brasil_-_Dados_Publicos_CNPJ
 """)
+        
+    finally:
+        # Fechar pool de conexões
+        await pool.close()
+
+if __name__ == "__main__":
+    asyncio.run(main())

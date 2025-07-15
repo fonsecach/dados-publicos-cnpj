@@ -1,0 +1,26 @@
+version: '3.8'
+
+services:
+  postgres:
+    image: bitnami/postgresql:16
+    container_name: receita_postgres
+    environment:
+      - POSTGRESQL_DATABASE=receita_cnpj
+      - POSTGRESQL_USERNAME=postgres
+      - POSTGRESQL_PASSWORD=senha123
+      - POSTGRESQL_ROOT_PASSWORD=senha123
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/bitnami/postgresql
+      - ./code/banco_de_dados.sql:/docker-entrypoint-initdb.d/init.sql
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d receita_cnpj"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+
+volumes:
+  postgres_data:
+    driver: local
