@@ -2,6 +2,7 @@
 import asyncio
 import datetime
 import gc
+import logging
 import pathlib
 from dotenv import load_dotenv
 import bs4 as bs
@@ -15,6 +16,22 @@ import httpx
 from tenacity import retry, stop_after_attempt, wait_exponential
 import zipfile
 import concurrent.futures
+from rich.console import Console
+from rich.progress import Progress, TaskID, BarColumn, TextColumn, TimeElapsedColumn, TimeRemainingColumn, MofNCompleteColumn
+from rich.logging import RichHandler
+from rich.table import Table
+
+# Configuração de logging e console
+console = Console()
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    handlers=[
+        RichHandler(console=console, rich_tracebacks=True),
+        logging.FileHandler("etl_log.log", encoding="utf-8")
+    ]
+)
+logger = logging.getLogger(__name__)
 
 
 def check_diff(url, file_name):
@@ -161,7 +178,7 @@ try:
           'extracted_files: ' + str(extracted_files))
 except:
     pass
-    print('Erro na definição dos diretórios, verifique o arquivo ".env" ou o local informado do seu arquivo de configuração.')
+    logger.error('Erro na definição dos diretórios, verifique o arquivo ".env" ou o local informado do seu arquivo de configuração.')
 
 # Fazer request com httpx
 with httpx.Client(headers={'User-Agent': 'Mozilla/5.0'}) as client:
@@ -280,7 +297,7 @@ async def download_all_files():
             try:
                 await download_file_async(url, file_path, download_semaphore)
             except Exception as e:
-                print(f'\nErro ao baixar {file_name}: {e}')
+                logger.error(f'Erro ao baixar {file_name}: {e}')
                 return False
         else:
             print(f'{file_name} já existe e está atualizado.')
@@ -508,13 +525,20 @@ async def process_empresa_files(pool):
         empresa_dtypes = {0: object, 1: object, 2: 'Int32', 3: 'Int32', 4: object, 5: 'Int32', 6: object}
         extracted_file_path = os.path.join(extracted_files, arquivos_empresa[e])
 
-        empresa = pd.read_csv(filepath_or_buffer=extracted_file_path,
-                              sep=';',
-                              skiprows=0,
-                              header=None,
-                              dtype=empresa_dtypes,
-                              encoding='latin-1',
-        )
+        try:
+            empresa = pd.read_csv(filepath_or_buffer=extracted_file_path,
+                                  sep=';',
+                                  skiprows=0,
+                                  header=None,
+                                  dtype=empresa_dtypes,
+                                  encoding='latin-1',
+            )
+        except pd.errors.EmptyDataError:
+            print(f'Arquivo {arquivos_empresa[e]} está vazio. Pulando...')
+            continue
+        except Exception as e:
+            logger.error(f'Erro ao ler arquivo {arquivos_empresa[e]}: {str(e)}')
+            continue
 
         empresa = empresa.reset_index()
         del empresa['index']
@@ -528,7 +552,7 @@ async def process_empresa_files(pool):
 
         # Gravar dados no banco usando função assíncrona
         await to_sql_async(empresa, pool, 'empresa')
-        print('Arquivo ' + arquivos_empresa[e] + ' inserido com sucesso no banco de dados!')
+        logger.info(f'Arquivo {arquivos_empresa[e]} inserido com sucesso no banco de dados!')
         
         # Liberar memória explicitamente
         del empresa
@@ -545,71 +569,87 @@ async def process_estabelecimento_files(pool):
     Processa arquivos de estabelecimento de forma assíncrona
     '''
     estabelecimento_insert_start = time.time()
-    print("""
-###############################
-## Arquivos de ESTABELECIMENTO:
-###############################
-""")
+    logger.info("Iniciando processamento dos arquivos de ESTABELECIMENTO")
+    console.print("\n[bold green]###############################[/bold green]")
+    console.print("[bold green]## Arquivos de ESTABELECIMENTO:[/bold green]")
+    console.print("[bold green]###############################[/bold green]\n")
 
-    print('Tem %i arquivos de estabelecimento!' % len(arquivos_estabelecimento))
-    for e in range(0, len(arquivos_estabelecimento)):
-        print('Trabalhando no arquivo: '+arquivos_estabelecimento[e]+' [...]')
-        try:
-            del estabelecimento
-        except:
-            pass
-
-        estabelecimento_dtypes = {0: object, 1: object, 2: object, 3: 'Int32', 4: object, 5: 'Int32',
-                                  6: object, 7: 'Int32', 8: object, 9: 'Int32', 10: object, 11: 'Int32',
-                                  12: object, 13: object, 14: object, 15: object, 16: object, 17: object, 18: object, 19: object,
-                                  20: 'Int32', 21: object, 22: object, 23: object, 24: object, 25: object,
-                                  26: object, 27: object, 28: object, 29: object}
-        extracted_file_path = os.path.join(extracted_files, arquivos_estabelecimento[e])
-
-        NROWS = 2000000
-        part = 0
-        while True:
+    logger.info(f'Tem {len(arquivos_estabelecimento)} arquivos de estabelecimento!')
+    
+    with Progress(
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(),
+        MofNCompleteColumn(),
+        TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
+        TimeElapsedColumn(),
+        TimeRemainingColumn(),
+        console=console
+    ) as progress:
+        
+        files_task = progress.add_task("Processando arquivos ESTABELECIMENTO", total=len(arquivos_estabelecimento))
+        
+        for e in range(0, len(arquivos_estabelecimento)):
+            logger.info(f'Trabalhando no arquivo: {arquivos_estabelecimento[e]}')
             try:
-                estabelecimento = pd.read_csv(filepath_or_buffer=extracted_file_path,
-                                              sep=';',
-                                              nrows=NROWS,
-                                              skiprows=NROWS * part,
-                                              header=None,
-                                              dtype=estabelecimento_dtypes,
-                                              encoding='latin-1')
-            except pd.errors.EmptyDataError:
-                print(f"Reached end of file {arquivos_estabelecimento[e]} at part {part}")
-                break
-            except Exception as e:
-                print(f"Error reading file {arquivos_estabelecimento[e]} at part {part}: {str(e)}")
-                break
+                del estabelecimento
+            except:
+                pass
 
-            if estabelecimento.empty:
-                break
+            estabelecimento_dtypes = {0: object, 1: object, 2: object, 3: 'Int32', 4: object, 5: 'Int32',
+                                      6: object, 7: 'Int32', 8: object, 9: 'Int32', 10: object, 11: 'Int32',
+                                      12: object, 13: object, 14: object, 15: object, 16: object, 17: object, 18: object, 19: object,
+                                      20: 'Int32', 21: object, 22: object, 23: object, 24: object, 25: object,
+                                      26: object, 27: object, 28: object, 29: object}
+            extracted_file_path = os.path.join(extracted_files, arquivos_estabelecimento[e])
 
-            estabelecimento = estabelecimento.reset_index()
-            del estabelecimento['index']
+            parts_task = progress.add_task(f"Processando {arquivos_estabelecimento[e]}", total=None)
+            NROWS = 2000000
+            part = 0
+            while True:
+                try:
+                    estabelecimento = pd.read_csv(filepath_or_buffer=extracted_file_path,
+                                                  sep=';',
+                                                  nrows=NROWS,
+                                                  skiprows=NROWS * part,
+                                                  header=None,
+                                                  dtype=estabelecimento_dtypes,
+                                                  encoding='latin-1')
+                except pd.errors.EmptyDataError:
+                    logger.info(f"Fim do arquivo {arquivos_estabelecimento[e]} na parte {part}")
+                    break
+                except Exception as ex:
+                    logger.error(f"Erro ao ler arquivo {arquivos_estabelecimento[e]} na parte {part}: {str(ex)}")
+                    break
 
-            estabelecimento.columns = ['cnpj_basico', 'cnpj_ordem', 'cnpj_dv', 'identificador_matriz_filial',
-                                       'nome_fantasia', 'situacao_cadastral', 'data_situacao_cadastral', 'motivo_situacao_cadastral',
-                                       'nome_cidade_exterior', 'pais', 'data_inicio_atividade', 'cnae_fiscal_principal',
-                                       'cnae_fiscal_secundaria', 'tipo_logradouro', 'logradouro', 'numero', 'complemento',
-                                       'bairro', 'cep', 'uf', 'municipio', 'ddd_1', 'telefone_1', 'ddd_2', 'telefone_2',
-                                       'ddd_fax', 'fax', 'correio_eletronico', 'situacao_especial', 'data_situacao_especial']
+                if estabelecimento.empty:
+                    break
 
-            await to_sql_async(estabelecimento, pool, 'estabelecimento')
-            print(f'Parte {part+1} do arquivo {arquivos_estabelecimento[e]} inserida com sucesso!')
-            
-            part += 1
-            del estabelecimento
-            gc.collect()
+                estabelecimento = estabelecimento.reset_index()
+                del estabelecimento['index']
 
-        print('Arquivo ' + arquivos_estabelecimento[e] + ' inserido com sucesso no banco de dados!')
+                estabelecimento.columns = ['cnpj_basico', 'cnpj_ordem', 'cnpj_dv', 'identificador_matriz_filial',
+                                           'nome_fantasia', 'situacao_cadastral', 'data_situacao_cadastral', 'motivo_situacao_cadastral',
+                                           'nome_cidade_exterior', 'pais', 'data_inicio_atividade', 'cnae_fiscal_principal',
+                                           'cnae_fiscal_secundaria', 'tipo_logradouro', 'logradouro', 'numero', 'complemento',
+                                           'bairro', 'cep', 'uf', 'municipio', 'ddd_1', 'telefone_1', 'ddd_2', 'telefone_2',
+                                           'ddd_fax', 'fax', 'correio_eletronico', 'situacao_especial', 'data_situacao_especial']
 
-    print('Arquivos de estabelecimento finalizados!')
+                await to_sql_async(estabelecimento, pool, 'estabelecimento')
+                logger.info(f'Parte {part+1} do arquivo {arquivos_estabelecimento[e]} inserida com sucesso!')
+                progress.update(parts_task, advance=1)
+                
+                part += 1
+                del estabelecimento
+                gc.collect()
+
+            logger.info(f'Arquivo {arquivos_estabelecimento[e]} inserido com sucesso no banco de dados!')
+            progress.update(files_task, advance=1)
+            progress.remove_task(parts_task)
+
+    logger.info('Arquivos de estabelecimento finalizados!')
     estabelecimento_insert_end = time.time()
     estabelecimento_Tempo_insert = round((estabelecimento_insert_end - estabelecimento_insert_start))
-    print('Tempo de execução do processo de estabelecimento (em segundos): ' + str(estabelecimento_Tempo_insert))
+    logger.info(f'Tempo de execução do processo de estabelecimento (em segundos): {estabelecimento_Tempo_insert}')
 
 
 async def process_socios_files(pool):
@@ -633,13 +673,20 @@ async def process_socios_files(pool):
         socios_dtypes = {0: object, 1: 'Int32', 2: object, 3: object, 4: 'Int32', 5: object, 6: 'Int32',
                          7: object, 8: object, 9: 'Int32', 10: 'Int32'}
         extracted_file_path = os.path.join(extracted_files, arquivos_socios[e])
-        socios = pd.read_csv(filepath_or_buffer=extracted_file_path,
-                              sep=';',
-                              skiprows=0,
-                              header=None,
-                              dtype=socios_dtypes,
-                              encoding='latin-1',
-        )
+        try:
+            socios = pd.read_csv(filepath_or_buffer=extracted_file_path,
+                                  sep=';',
+                                  skiprows=0,
+                                  header=None,
+                                  dtype=socios_dtypes,
+                                  encoding='latin-1',
+            )
+        except pd.errors.EmptyDataError:
+            print(f'Arquivo {arquivos_socios[e]} está vazio. Pulando...')
+            continue
+        except Exception as e:
+            logger.error(f'Erro ao ler arquivo {arquivos_socios[e]}: {str(e)}')
+            continue
 
         # Tratamento do arquivo antes de inserir na base:
         socios = socios.reset_index()
@@ -660,7 +707,7 @@ async def process_socios_files(pool):
 
         # Gravar dados no banco usando função assíncrona
         await to_sql_async(socios, pool, 'socios')
-        print('Arquivo ' + arquivos_socios[e] + ' inserido com sucesso no banco de dados!')
+        logger.info(f'Arquivo {arquivos_socios[e]} inserido com sucesso no banco de dados!')
         
         del socios
         gc.collect()
@@ -676,60 +723,80 @@ async def process_simples_files(pool):
     Processa arquivos do Simples Nacional de forma assíncrona
     '''
     simples_insert_start = time.time()
-    print("""
-################################
-## Arquivos do SIMPLES NACIONAL:
-################################
-""")
+    logger.info("Iniciando processamento dos arquivos do SIMPLES NACIONAL")
+    console.print("\n[bold blue]################################[/bold blue]")
+    console.print("[bold blue]## Arquivos do SIMPLES NACIONAL:[/bold blue]")
+    console.print("[bold blue]################################[/bold blue]\n")
 
-    for e in range(0, len(arquivos_simples)):
-        print('Trabalhando no arquivo: '+arquivos_simples[e]+' [...]')
+    with Progress(
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(),
+        MofNCompleteColumn(),
+        TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
+        TimeElapsedColumn(),
+        TimeRemainingColumn(),
+        console=console
+    ) as progress:
         
-        simples_dtypes = ({0: object, 1: object, 2: object, 3: object, 4: object, 5: object, 6: object})
-        extracted_file_path = os.path.join(extracted_files, arquivos_simples[e])
-
-        simples_lenght = sum(1 for line in open(extracted_file_path, "r"))
-        print('Linhas no arquivo do Simples '+ arquivos_simples[e] +': '+str(simples_lenght))
-
-        tamanho_das_partes = 1000000 # Registros por carga
-        qtd_loops = round(simples_lenght / tamanho_das_partes, 0)
-        nrows = tamanho_das_partes
-        print('Esse arquivo será carregado em '+str(int(qtd_loops+1))+' partes.')
-
-        skiprows = 0
-        for i in range(int(qtd_loops+1)):
-            print('Iniciando a parte ' + str(i+1) + ' [...]')
-
-            simples = pd.read_csv(filepath_or_buffer=extracted_file_path,
-                                  sep=';',
-                                  nrows=nrows,
-                                  skiprows=skiprows,
-                                  header=None,
-                                  dtype=simples_dtypes,
-                                  encoding='latin-1')
-
-            if simples.empty:
-                break
-
-            simples = simples.reset_index()
-            del simples['index']
-
-            simples.columns = ['cnpj_basico', 'opcao_pelo_simples', 'data_opcao_simples', 'data_exclusao_simples', 'opcao_mei', 'data_opcao_mei', 'data_exclusao_mei']
-
-            # Gravar dados no banco usando função assíncrona
-            await to_sql_async(simples, pool, 'simples')
+        files_task = progress.add_task("Processando arquivos SIMPLES", total=len(arquivos_simples))
+        
+        for e in range(0, len(arquivos_simples)):
+            logger.info(f'Trabalhando no arquivo: {arquivos_simples[e]}')
             
-            skiprows = skiprows + nrows
-            print('Parte ' + str(i+1) + ' do arquivo ' + arquivos_simples[e] + ' inserida com sucesso no banco de dados!')
-            del simples
-            gc.collect()
-            
-        print('Arquivo ' + arquivos_simples[e] + ' inserido com sucesso no banco de dados!')
+            simples_dtypes = ({0: object, 1: object, 2: object, 3: object, 4: object, 5: object, 6: object})
+            extracted_file_path = os.path.join(extracted_files, arquivos_simples[e])
 
-    print('Arquivos do Simples Nacional finalizados!')
+            simples_lenght = sum(1 for line in open(extracted_file_path, "r"))
+            logger.info(f'Linhas no arquivo do Simples {arquivos_simples[e]}: {simples_lenght}')
+
+            tamanho_das_partes = 1000000 # Registros por carga
+            qtd_loops = round(simples_lenght / tamanho_das_partes, 0)
+            nrows = tamanho_das_partes
+            logger.info(f'Esse arquivo será carregado em {int(qtd_loops+1)} partes')
+
+            parts_task = progress.add_task(f"Processando {arquivos_simples[e]}", total=int(qtd_loops+1))
+            
+            skiprows = 0
+            for i in range(int(qtd_loops+1)):
+                logger.debug(f'Iniciando a parte {i+1} de {int(qtd_loops+1)}')
+
+                try:
+                    simples = pd.read_csv(filepath_or_buffer=extracted_file_path,
+                                          sep=';',
+                                          nrows=nrows,
+                                          skiprows=skiprows,
+                                          header=None,
+                                          dtype=simples_dtypes,
+                                          encoding='latin-1')
+                except pd.errors.EmptyDataError:
+                    logger.info(f'Fim do arquivo alcançado na parte {i+1}. Encerrando processamento.')
+                    break
+
+                if simples.empty:
+                    break
+
+                simples = simples.reset_index()
+                del simples['index']
+
+                simples.columns = ['cnpj_basico', 'opcao_pelo_simples', 'data_opcao_simples', 'data_exclusao_simples', 'opcao_mei', 'data_opcao_mei', 'data_exclusao_mei']
+
+                # Gravar dados no banco usando função assíncrona
+                await to_sql_async(simples, pool, 'simples')
+                
+                skiprows = skiprows + nrows
+                logger.info(f'Parte {i+1} do arquivo {arquivos_simples[e]} inserida com sucesso no banco de dados!')
+                progress.update(parts_task, advance=1)
+                del simples
+                gc.collect()
+                
+            logger.info(f'Arquivo {arquivos_simples[e]} inserido com sucesso no banco de dados!')
+            progress.update(files_task, advance=1)
+            progress.remove_task(parts_task)
+
+    logger.info('Arquivos do Simples Nacional finalizados!')
     simples_insert_end = time.time()
     simples_Tempo_insert = round((simples_insert_end - simples_insert_start))
-    print('Tempo de execução do processo do Simples Nacional (em segundos): ' + str(simples_Tempo_insert))
+    logger.info(f'Tempo de execução do processo do Simples Nacional (em segundos): {simples_Tempo_insert}')
 
 
 async def process_outros_arquivos(pool):
@@ -742,12 +809,19 @@ async def process_outros_arquivos(pool):
     if arquivos_cnae:
         for e in range(0, len(arquivos_cnae)):
             extracted_file_path = os.path.join(extracted_files, arquivos_cnae[e])
-            cnae = pd.read_csv(filepath_or_buffer=extracted_file_path, sep=';', skiprows=0, header=None, dtype={0: 'Int32', 1: 'object'}, encoding='latin-1')
+            try:
+                cnae = pd.read_csv(filepath_or_buffer=extracted_file_path, sep=';', skiprows=0, header=None, dtype={0: 'Int32', 1: 'object'}, encoding='latin-1')
+            except pd.errors.EmptyDataError:
+                print(f'Arquivo CNAE {arquivos_cnae[e]} está vazio. Pulando...')
+                continue
+            except Exception as e:
+                logger.error(f'Erro ao ler arquivo CNAE {arquivos_cnae[e]}: {str(e)}')
+                continue
             cnae = cnae.reset_index()
             del cnae['index']
             cnae.columns = ['codigo', 'descricao']
             await to_sql_async(cnae, pool, 'cnae')
-            print(f'Arquivo CNAE {arquivos_cnae[e]} inserido!')
+            logger.info(f'Arquivo CNAE {arquivos_cnae[e]} inserido!')
             del cnae
             gc.collect()
 
@@ -762,55 +836,80 @@ async def process_outros_arquivos(pool):
         if arquivo_tipo:
             for e in range(0, len(arquivo_tipo)):
                 extracted_file_path = os.path.join(extracted_files, arquivo_tipo[e])
-                df = pd.read_csv(filepath_or_buffer=extracted_file_path, sep=';', skiprows=0, header=None, dtype={0: 'Int32', 1: 'object'}, encoding='latin-1')
+                try:
+                    df = pd.read_csv(filepath_or_buffer=extracted_file_path, sep=';', skiprows=0, header=None, dtype={0: 'Int32', 1: 'object'}, encoding='latin-1')
+                except pd.errors.EmptyDataError:
+                    print(f'Arquivo {nome_tabela} {arquivo_tipo[e]} está vazio. Pulando...')
+                    continue
+                except Exception as e:
+                    logger.error(f'Erro ao ler arquivo {nome_tabela} {arquivo_tipo[e]}: {str(e)}')
+                    continue
                 df = df.reset_index()
                 del df['index']
                 df.columns = ['codigo', 'descricao']
                 await to_sql_async(df, pool, nome_tabela)
-                print(f'Arquivo {nome_tabela} {arquivo_tipo[e]} inserido!')
+                logger.info(f'Arquivo {nome_tabela} {arquivo_tipo[e]} inserido!')
                 del df
                 gc.collect()
 
 
 async def create_indexes(pool):
     '''
-    Cria índices nas tabelas de forma assíncrona
+    Cria índices nas tabelas de forma assíncrona com timeout maior
     '''
     print("Criando índices...")
     
-    async with pool.acquire() as conn:
-        await conn.execute("CREATE INDEX IF NOT EXISTS empresa_cnpj ON empresa(cnpj_basico);")
-        await conn.execute("CREATE INDEX IF NOT EXISTS estabelecimento_cnpj ON estabelecimento(cnpj_basico);")
-        await conn.execute("CREATE INDEX IF NOT EXISTS socios_cnpj ON socios(cnpj_basico);")
-        await conn.execute("CREATE INDEX IF NOT EXISTS simples_cnpj ON simples(cnpj_basico);")
+    indexes = [
+        "CREATE INDEX IF NOT EXISTS empresa_cnpj ON empresa(cnpj_basico);",
+        "CREATE INDEX IF NOT EXISTS estabelecimento_cnpj ON estabelecimento(cnpj_basico);",
+        "CREATE INDEX IF NOT EXISTS socios_cnpj ON socios(cnpj_basico);",
+        "CREATE INDEX IF NOT EXISTS simples_cnpj ON simples(cnpj_basico);"
+    ]
     
-    print("Índices criados com sucesso!")
+    async with pool.acquire() as conn:
+        for index_sql in indexes:
+            try:
+                print(f"Criando índice: {index_sql}")
+                await conn.execute(index_sql)
+                print("✓ Índice criado com sucesso!")
+            except Exception as e:
+                print(f"✗ Erro ao criar índice: {e}")
+                continue
+    
+    print("Processo de criação de índices concluído!")
 
 
 async def main():
     '''
     Função principal que executa todo o processo de ETL de forma assíncrona
     '''
-    print("=== PROCESSO ETL ASSÍNCRONO INICIADO ===")
+    console.print("\n[bold magenta]" + "="*50 + "[/bold magenta]")
+    console.print("[bold magenta]    PROCESSO ETL ASSÍNCRONO INICIADO    [/bold magenta]")
+    console.print("[bold magenta]" + "="*50 + "[/bold magenta]\n")
+    
     start_time = time.time()
+    logger.info("Processo ETL iniciado")
     
     try:
         # Fase 1: Download paralelo
-        print("\n[FASE 1] Download dos arquivos...")
+        console.print("\n[bold yellow]📥 [FASE 1] Download dos arquivos...[/bold yellow]")
         download_start = time.time()
         await download_all_files()
         download_time = time.time() - download_start
-        print(f"Download concluído em {download_time:.1f}s")
+        logger.info(f"Download concluído em {download_time:.1f}s")
+        console.print(f"[green]✅ Download concluído em {download_time:.1f}s[/green]")
         
         # Fase 2: Extração paralela
-        print("\n[FASE 2] Extração dos arquivos...")
+        console.print("\n[bold yellow]📂 [FASE 2] Extração dos arquivos...[/bold yellow]")
         extract_start = time.time()
         await extract_all_files()
         extract_time = time.time() - extract_start
-        print(f"Extração concluída em {extract_time:.1f}s")
+        logger.info(f"Extração concluída em {extract_time:.1f}s")
+        console.print(f"[green]✅ Extração concluída em {extract_time:.1f}s[/green]")
         
         # Fase 3: Processamento de dados
-        print("\n[FASE 3] Processamento e inserção no banco...")
+        console.print("\n[bold yellow]🗄️  [FASE 3] Processamento e inserção no banco...[/bold yellow]")
+        logger.info("Iniciando processamento e inserção no banco")
         
         # Criar pool de conexões
         pool = await create_db_pool()
@@ -826,22 +925,40 @@ async def main():
             await process_simples_files(pool)
             await process_outros_arquivos(pool)
             
-            # Criar índices
-            await create_indexes(pool)
+            # Criar índices (opcional - pode ser feito separadamente)
+            print("\n[INFO] Criação de índices desabilitada para evitar timeout.")
+            print("[INFO] Execute o script 'create_indexes.py' separadamente para criar os índices.")
             
         finally:
             # Fechar pool de conexões
             await pool.close()
         
         total_time = time.time() - start_time
-        print(f"\n=== PROCESSO CONCLUÍDO EM {total_time:.1f}s ===")
-        print("""Processo 100% finalizado! Você já pode usar seus dados no BD!
- - Desenvolvido por: Aphonso Henrique do Amaral Rafael
- - Contribua com esse projeto aqui: https://github.com/aphonsoar/Receita_Federal_do_Brasil_-_Dados_Publicos_CNPJ
-""")
+        minutes = int(total_time // 60)
+        seconds = int(total_time % 60)
+        
+        console.print(f"\n[bold green]" + "="*60 + "[/bold green]")
+        console.print(f"[bold green]    ✅ PROCESSO CONCLUÍDO EM {minutes}m {seconds}s ({total_time:.1f}s)    [/bold green]")
+        console.print(f"[bold green]" + "="*60 + "[/bold green]")
+        
+        # Resumo dos tempos
+        table = Table(title="📊 Resumo de Performance")
+        table.add_column("Fase", style="cyan")
+        table.add_column("Tempo", style="magenta")
+        table.add_row("Download", f"{download_time:.1f}s")
+        table.add_row("Extração", f"{extract_time:.1f}s") 
+        table.add_row("Processamento", f"{total_time - download_time - extract_time:.1f}s")
+        table.add_row("Total", f"{total_time:.1f}s", style="bold")
+        console.print(table)
+        
+        logger.info(f"Processo ETL concluído em {total_time:.1f}s")
+        console.print("\n[bold blue]🎉 Processo 100% finalizado! Você já pode usar seus dados no BD![/bold blue]")
+        console.print("[dim] - Desenvolvido por: Aphonso Henrique do Amaral Rafael[/dim]")
+        console.print("[dim] - Contribua: https://github.com/aphonsoar/Receita_Federal_do_Brasil_-_Dados_Publicos_CNPJ[/dim]")
         
     except Exception as e:
-        print(f"\n✗ ERRO NO PROCESSO ETL: {e}")
+        logger.error(f"Erro no processo ETL: {e}", exc_info=True)
+        console.print(f"\n[bold red]✗ ERRO NO PROCESSO ETL: {e}[/bold red]")
         raise
 
 
