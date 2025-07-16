@@ -17,11 +17,18 @@ curl -LsSf https://astral.sh/uv/install.sh | sh
 ### 2. Clonar e configurar o projeto
 
 ```bash
-cd /caminho/para/o/projeto
+git clone https://github.com/[usuario]/Receita_Federal_do_Brasil_-_Dados_Publicos_CNPJ.git
+cd Receita_Federal_do_Brasil_-_Dados_Publicos_CNPJ
 uv sync
 ```
 
-### 3. Iniciar o PostgreSQL com Docker
+### 3. Configurar variáveis de ambiente
+
+```bash
+cp .env.example .env
+```
+
+### 4. Iniciar o PostgreSQL com Docker
 
 ```bash
 docker-compose up -d
@@ -32,16 +39,16 @@ Isso irá:
 - Configurar o banco de dados `receita_cnpj`
 - Executar o script de inicialização do banco
 
-### 4. Verificar se o banco está rodando
+### 5. Verificar se o banco está rodando
 
 ```bash
 docker-compose ps
 ```
 
-### 5. Executar o ETL
+### 6. Executar o ETL
 
 ```bash
-uv run python code/ETL_coletar_dados_e_gravar_BD.py
+uv run python src/ETL_dados_publicos_empresas.py
 ```
 
 ## Configurações
@@ -63,12 +70,20 @@ EXTRACTED_FILES_PATH=./data/extracted
 
 ## Melhorias Implementadas
 
+### Estrutura Refatorada (2025)
+1. **Reorganização de código**: Código movido para diretório `src/` para melhor organização
+2. **Novo script ETL**: `src/ETL_dados_publicos_empresas.py` com melhor estrutura
+3. **Configuração simplificada**: Arquivo `.env.example` para configuração inicial
+
+### Melhorias de 2024
 1. **Docker Compose**: PostgreSQL Bitnami containerizado
 2. **httpx**: Substituiu wget com retry automático
 3. **Paths Linux**: Compatibilidade com sistemas Unix
-4. **URL Atualizada**: Aponta para dados de 2025-06
-5. **uv**: Gerenciamento moderno de dependências
+4. **URL Atualizada**: Aponta para dados atualizados
+5. **uv**: Gerenciamento moderno de dependências Python
 6. **Retry Logic**: Download com tentativas automáticas
+7. **Tipos de dados**: Colunas numéricas como 'Int32' para melhor performance
+8. **psycopg2-binary**: Dependência simplificada para instalação
 
 ## Comandos Úteis
 
