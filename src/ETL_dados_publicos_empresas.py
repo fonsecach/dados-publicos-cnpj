@@ -569,13 +569,20 @@ async def process_estabelecimento_files(pool):
         NROWS = 2000000
         part = 0
         while True:
-            estabelecimento = pd.read_csv(filepath_or_buffer=extracted_file_path,
-                                          sep=';',
-                                          nrows=NROWS,
-                                          skiprows=NROWS * part,
-                                          header=None,
-                                          dtype=estabelecimento_dtypes,
-                                          encoding='latin-1')
+            try:
+                estabelecimento = pd.read_csv(filepath_or_buffer=extracted_file_path,
+                                              sep=';',
+                                              nrows=NROWS,
+                                              skiprows=NROWS * part,
+                                              header=None,
+                                              dtype=estabelecimento_dtypes,
+                                              encoding='latin-1')
+            except pd.errors.EmptyDataError:
+                print(f"Reached end of file {arquivos_estabelecimento[e]} at part {part}")
+                break
+            except Exception as e:
+                print(f"Error reading file {arquivos_estabelecimento[e]} at part {part}: {str(e)}")
+                break
 
             if estabelecimento.empty:
                 break
