@@ -48,16 +48,43 @@ async def to_sql_async(dataframe, pool, table_name, batch_size=8192):
     '''
     Insere dados de forma assíncrona usando batch inserts otimizados
     '''
+    from datetime import datetime, date
+    
     total = len(dataframe)
     columns = list(dataframe.columns)
+    
+    # Definir colunas de data para cada tabela
+    date_columns = {
+        'estabelecimento': ['data_situacao_cadastral', 'data_inicio_atividade', 'data_situacao_especial'],
+        'socios': ['data_entrada_sociedade'],
+        'simples': ['data_opcao_simples', 'data_exclusao_simples', 'data_opcao_mei', 'data_exclusao_mei']
+    }
+    
+    def convert_date_string(date_str):
+        '''Converte string de data YYYYMMDD para objeto date'''
+        if pd.isna(date_str) or date_str == '' or date_str == '00000000' or date_str == '0':
+            return None
+        try:
+            if isinstance(date_str, str) and len(date_str) == 8 and date_str.isdigit():
+                return datetime.strptime(date_str, '%Y%m%d').date()
+            return None if isinstance(date_str, str) else date_str
+        except (ValueError, TypeError):
+            return None
     
     # Converter DataFrame para lista de tuplas e substituir NaN por None
     import numpy as np
     records = []
     for row in dataframe.values:
-        # Converter NaN para None para compatibilidade com PostgreSQL
-        clean_row = tuple(None if pd.isna(val) else val for val in row)
-        records.append(clean_row)
+        clean_row = []
+        for i, val in enumerate(row):
+            if pd.isna(val):
+                clean_row.append(None)
+            elif table_name in date_columns and i < len(columns) and columns[i] in date_columns[table_name]:
+                # Converter colunas de data
+                clean_row.append(convert_date_string(val))
+            else:
+                clean_row.append(val)
+        records.append(tuple(clean_row))
     
     # Criar statement de insert
     placeholders = ','.join(['$' + str(i+1) for i in range(len(columns))])
