@@ -340,6 +340,45 @@ async def extract_all_files():
     print('Extração concluída!')
 
 
+async def create_database_if_not_exists():
+    '''
+    Cria o banco de dados se não existir
+    '''
+    user = getEnv('DB_USER')
+    passw = getEnv('DB_PASSWORD')
+    host = getEnv('DB_HOST')
+    port = getEnv('DB_PORT')
+    database = getEnv('DB_NAME')
+    
+    # Conectar ao banco padrão postgres para criar o banco se necessário
+    try:
+        conn = await asyncpg.connect(
+            user=user,
+            password=passw,
+            database='postgres',
+            host=host,
+            port=port
+        )
+        
+        # Verificar se o banco existe
+        exists = await conn.fetchval(
+            "SELECT 1 FROM pg_database WHERE datname = $1", database
+        )
+        
+        if not exists:
+            console.print(f"[yellow]Criando banco de dados: {database}[/yellow]")
+            await conn.execute(f'CREATE DATABASE "{database}"')
+            console.print(f"[green]✅ Banco de dados '{database}' criado com sucesso![/green]")
+        else:
+            console.print(f"[blue]Banco de dados '{database}' já existe[/blue]")
+        
+        await conn.close()
+        
+    except Exception as e:
+        logger.error(f"Erro ao criar banco de dados: {e}")
+        raise
+
+
 async def create_db_pool():
     '''
     Cria pool de conexões assíncronas com o PostgreSQL
@@ -910,6 +949,9 @@ async def main():
         # Fase 3: Processamento de dados
         console.print("\n[bold yellow]🗄️  [FASE 3] Processamento e inserção no banco...[/bold yellow]")
         logger.info("Iniciando processamento e inserção no banco")
+        
+        # Criar banco de dados se não existir
+        await create_database_if_not_exists()
         
         # Criar pool de conexões
         pool = await create_db_pool()
