@@ -20,6 +20,7 @@ from rich.console import Console
 from rich.progress import Progress, TaskID, BarColumn, TextColumn, TimeElapsedColumn, TimeRemainingColumn, MofNCompleteColumn
 from rich.logging import RichHandler
 from rich.table import Table
+import json
 
 # Configuração de logging e console
 console = Console()
@@ -61,7 +62,54 @@ def makedirs(path):
         os.makedirs(path)
 
 
-async def to_sql_async(dataframe, pool, table_name, batch_size=8192):
+CHECKPOINT_FILE = os.path.join(os.path.dirname(__file__), '..', '..', 'checkpoint.json')
+
+def save_checkpoint(stage, file_index=None, batch_index=None):
+    '''
+    Salva checkpoint do progresso atual
+    '''
+    checkpoint = {
+        'stage': stage,
+        'file_index': file_index,
+        'batch_index': batch_index,
+        'timestamp': datetime.datetime.now().isoformat()
+    }
+    
+    try:
+        with open(CHECKPOINT_FILE, 'w') as f:
+            json.dump(checkpoint, f, indent=2)
+        logger.info(f"Checkpoint salvo: {stage} - arquivo {file_index}")
+    except Exception as e:
+        logger.error(f"Erro ao salvar checkpoint: {e}")
+
+def load_checkpoint():
+    '''
+    Carrega checkpoint salvo
+    '''
+    try:
+        if os.path.exists(CHECKPOINT_FILE):
+            with open(CHECKPOINT_FILE, 'r') as f:
+                checkpoint = json.load(f)
+            logger.info(f"Checkpoint carregado: {checkpoint['stage']} - arquivo {checkpoint.get('file_index', 0)}")
+            return checkpoint
+    except Exception as e:
+        logger.error(f"Erro ao carregar checkpoint: {e}")
+    
+    return None
+
+def clear_checkpoint():
+    '''
+    Remove checkpoint após conclusão
+    '''
+    try:
+        if os.path.exists(CHECKPOINT_FILE):
+            os.remove(CHECKPOINT_FILE)
+            logger.info("Checkpoint removido após conclusão")
+    except Exception as e:
+        logger.error(f"Erro ao remover checkpoint: {e}")
+
+
+async def to_sql_async(dataframe, pool, table_name, batch_size=1500):
     '''
     Insere dados de forma assíncrona usando batch inserts otimizados
     '''
@@ -109,7 +157,7 @@ async def to_sql_async(dataframe, pool, table_name, batch_size=8192):
     
     async def insert_batch(batch_records, batch_num):
         async with pool.acquire() as conn:
-            await conn.executemany(insert_sql, batch_records)
+            await conn.executemany(insert_sql, batch_records, timeout=300)
             
         # Progress tracking
         completed = batch_num * batch_size
@@ -126,7 +174,7 @@ async def to_sql_async(dataframe, pool, table_name, batch_size=8192):
         tasks.append(task)
     
     # Executar todos os batches em paralelo (limitando concorrência)
-    semaphore = asyncio.Semaphore(10)  # Máximo 10 conexões simultâneas
+    semaphore = asyncio.Semaphore(5)  # Máximo 5 conexões simultâneas
     
     async def bounded_task(task):
         async with semaphore:
@@ -397,7 +445,7 @@ async def create_db_pool():
         port=port,
         min_size=5,
         max_size=20,
-        command_timeout=60,
+        command_timeout=300,
         server_settings={
             'client_encoding': 'utf8',
             'timezone': 'UTC'
@@ -615,6 +663,14 @@ async def process_estabelecimento_files(pool):
 
     logger.info(f'Tem {len(arquivos_estabelecimento)} arquivos de estabelecimento!')
     
+    # Verificar checkpoint
+    checkpoint = load_checkpoint()
+    start_index = 0
+    
+    if checkpoint and checkpoint['stage'] == 'estabelecimento':
+        start_index = checkpoint.get('file_index', 0)
+        console.print(f"[yellow]Retomando do arquivo {start_index + 1}/{len(arquivos_estabelecimento)}[/yellow]")
+    
     with Progress(
         TextColumn("[progress.description]{task.description}"),
         BarColumn(),
@@ -626,8 +682,9 @@ async def process_estabelecimento_files(pool):
     ) as progress:
         
         files_task = progress.add_task("Processando arquivos ESTABELECIMENTO", total=len(arquivos_estabelecimento))
+        progress.update(files_task, completed=start_index)
         
-        for e in range(0, len(arquivos_estabelecimento)):
+        for e in range(start_index, len(arquivos_estabelecimento)):
             logger.info(f'Trabalhando no arquivo: {arquivos_estabelecimento[e]}')
             try:
                 del estabelecimento
@@ -684,6 +741,9 @@ async def process_estabelecimento_files(pool):
             logger.info(f'Arquivo {arquivos_estabelecimento[e]} inserido com sucesso no banco de dados!')
             progress.update(files_task, advance=1)
             progress.remove_task(parts_task)
+            
+            # Salvar checkpoint após cada arquivo processado
+            save_checkpoint('estabelecimento', e + 1)
 
     logger.info('Arquivos de estabelecimento finalizados!')
     estabelecimento_insert_end = time.time()
@@ -961,15 +1021,33 @@ async def main():
             await setup_tables(pool)
             
             # Processar todos os tipos de arquivo
-            await process_empresa_files(pool)
-            await process_estabelecimento_files(pool)
-            await process_socios_files(pool)
-            await process_simples_files(pool)
+            checkpoint = load_checkpoint()
+            
+            # Verificar qual etapa retomar
+            if not checkpoint or checkpoint['stage'] == 'empresa':
+                await process_empresa_files(pool)
+                save_checkpoint('empresa_completed')
+            
+            if not checkpoint or checkpoint['stage'] in ['empresa', 'empresa_completed', 'estabelecimento']:
+                await process_estabelecimento_files(pool)
+                save_checkpoint('estabelecimento_completed')
+            
+            if not checkpoint or checkpoint['stage'] in ['empresa', 'empresa_completed', 'estabelecimento', 'estabelecimento_completed', 'socios']:
+                await process_socios_files(pool)
+                save_checkpoint('socios_completed')
+            
+            if not checkpoint or checkpoint['stage'] in ['empresa', 'empresa_completed', 'estabelecimento', 'estabelecimento_completed', 'socios', 'socios_completed', 'simples']:
+                await process_simples_files(pool)
+                save_checkpoint('simples_completed')
+            
             await process_outros_arquivos(pool)
             
             # Criar índices (opcional - pode ser feito separadamente)
             print("\n[INFO] Criação de índices desabilitada para evitar timeout.")
             print("[INFO] Execute o script 'create_indexes.py' separadamente para criar os índices.")
+            
+            # Limpar checkpoint após conclusão bem-sucedida
+            clear_checkpoint()
             
         finally:
             # Fechar pool de conexões
