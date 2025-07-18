@@ -109,7 +109,7 @@ def clear_checkpoint():
         logger.error(f"Erro ao remover checkpoint: {e}")
 
 
-async def to_sql_async(dataframe, pool, table_name, batch_size=1500):
+async def to_sql_async(dataframe, pool, table_name, batch_size=2600):
     '''
     Insere dados de forma assíncrona usando batch inserts otimizados
     '''
@@ -157,7 +157,7 @@ async def to_sql_async(dataframe, pool, table_name, batch_size=1500):
     
     async def insert_batch(batch_records, batch_num):
         async with pool.acquire() as conn:
-            await conn.executemany(insert_sql, batch_records, timeout=300)
+            await conn.executemany(insert_sql, batch_records, timeout=500)
             
         # Progress tracking
         completed = batch_num * batch_size
@@ -174,8 +174,8 @@ async def to_sql_async(dataframe, pool, table_name, batch_size=1500):
         tasks.append(task)
     
     # Executar todos os batches em paralelo (limitando concorrência)
-    semaphore = asyncio.Semaphore(5)  # Máximo 5 conexões simultâneas
-    
+    semaphore = asyncio.Semaphore(10)  # Máximo 10 conexões simultâneas
+
     async def bounded_task(task):
         async with semaphore:
             await task
@@ -443,9 +443,9 @@ async def create_db_pool():
         database=database,
         host=host,
         port=port,
-        min_size=5,
+        min_size=10,
         max_size=20,
-        command_timeout=300,
+        command_timeout=500,
         server_settings={
             'client_encoding': 'utf8',
             'timezone': 'UTC'
@@ -1073,8 +1073,6 @@ async def main():
         
         logger.info(f"Processo ETL concluído em {total_time:.1f}s")
         console.print("\n[bold blue]🎉 Processo 100% finalizado! Você já pode usar seus dados no BD![/bold blue]")
-        console.print("[dim] - Desenvolvido por: Aphonso Henrique do Amaral Rafael[/dim]")
-        console.print("[dim] - Contribua: https://github.com/aphonsoar/Receita_Federal_do_Brasil_-_Dados_Publicos_CNPJ[/dim]")
         
     except Exception as e:
         logger.error(f"Erro no processo ETL: {e}", exc_info=True)
