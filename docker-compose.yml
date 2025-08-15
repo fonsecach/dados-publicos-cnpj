@@ -2,15 +2,15 @@ version: '3.8'
 
 services:
   postgres:
-    image: bitnami/postgresql:16
+    image: bitnami/postgresql:17
     container_name: receita_postgres
     environment:
       - POSTGRESQL_DATABASE=receita_cnpj
       - POSTGRESQL_USERNAME=postgres
-      - POSTGRESQL_PASSWORD=senha123
-      - POSTGRESQL_ROOT_PASSWORD=senha123
+      - POSTGRESQL_PASSWORD=Li9Q3sDeofmTdO0sOwinx68yA452aksh
+      - POSTGRESQL_ROOT_PASSWORD=Li9Q3sDeofmTdO0sOwinx68yA452aksh
     ports:
-      - "5432:5432"
+      - "5436:5436"
     volumes:
       - postgres_data:/bitnami/postgresql
       - ./code/banco_de_dados.sql:/docker-entrypoint-initdb.d/init.sql

@@ -43,13 +43,28 @@ def check_diff(url, file_name):
     if not os.path.isfile(file_name):
         return True # ainda nao foi baixado
 
-    with httpx.Client(headers={'User-Agent': 'Mozilla/5.0'}) as client:
-        response = client.head(url)
-        new_size = int(response.headers.get('content-length', 0))
-        old_size = os.path.getsize(file_name)
-        if new_size != old_size:
-            os.remove(file_name)
-            return True # tamanho diferentes
+    import ssl
+    try:
+        # Configurar SSL mais permissivo
+        ssl_context = ssl.create_default_context()
+        ssl_context.check_hostname = False
+        ssl_context.verify_mode = ssl.CERT_NONE
+        
+        with httpx.Client(
+            headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'},
+            timeout=30.0,
+            verify=ssl_context,
+            follow_redirects=True
+        ) as client:
+            response = client.head(url)
+            new_size = int(response.headers.get('content-length', 0))
+            old_size = os.path.getsize(file_name)
+            if new_size != old_size:
+                os.remove(file_name)
+                return True # tamanho diferentes
+    except Exception as e:
+        logger.warning(f"Erro ao verificar arquivo {url}: {e}. Assumindo que precisa baixar.")
+        return True
 
     return False # arquivos sao iguais
 
@@ -208,8 +223,58 @@ if not os.path.isfile(dotenv_path):
 print(f'Carregando configurações de: {dotenv_path}')
 load_dotenv(dotenv_path=dotenv_path)
 
+# Solicitar ano e mês do usuário
+def get_year_month():
+    """Solicita ano e mês do usuário para formar a URL dos dados"""
+    import datetime
+    current_year = datetime.datetime.now().year
+    current_month = datetime.datetime.now().month
+    
+    print("\n" + "="*50)
+    print("CONFIGURAÇÃO DE ANO E MÊS PARA DOWNLOAD DOS DADOS")
+    print("="*50)
+    
+    while True:
+        try:
+            year = input(f"Digite o ano (exemplo: {current_year}): ").strip()
+            if not year:
+                year = current_year
+            else:
+                year = int(year)
+            
+            if year < 2019 or year > current_year:
+                print(f"❌ Ano deve estar entre 2019 e {current_year}")
+                continue
+            break
+        except ValueError:
+            print("❌ Por favor, digite um ano válido")
+    
+    while True:
+        try:
+            month = input(f"Digite o mês (1-12, exemplo: {current_month}): ").strip()
+            if not month:
+                month = current_month
+            else:
+                month = int(month)
+            
+            if month < 1 or month > 12:
+                print("❌ Mês deve estar entre 1 e 12")
+                continue
+            break
+        except ValueError:
+            print("❌ Por favor, digite um mês válido")
+    
+    return year, month
+
+# Obter ano e mês do usuário
+ano, mes = get_year_month()
+mes_formatado = f"{mes:02d}"  # Formatar mês com 2 dígitos
+
+print(f"\n✅ Configurado para baixar dados de: {ano}-{mes_formatado}")
+print("="*50)
+
 # URL de referencia da receita para baixar os arquivos .zip  
-base_url = "https://arquivos.receitafederal.gov.br/dados/cnpj/dados_abertos_cnpj/2025-06/"
+base_url = f"https://arquivos.receitafederal.gov.br/dados/cnpj/dados_abertos_cnpj/{ano}-{mes_formatado}/"
 
 # Read details from ".env" file:
 output_files = None
@@ -228,11 +293,49 @@ except:
     pass
     logger.error('Erro na definição dos diretórios, verifique o arquivo ".env" ou o local informado do seu arquivo de configuração.')
 
-# Fazer request com httpx
-with httpx.Client(headers={'User-Agent': 'Mozilla/5.0'}) as client:
-    response = client.get(base_url)
-    response.raise_for_status()
-    raw_html = response.content
+# Fazer request com httpx com tratamento de erros robusto
+def get_html_with_retry(url, max_retries=3):
+    """Faz request com retry e tratamento de erros SSL/TLS"""
+    import ssl
+    
+    for attempt in range(max_retries):
+        try:
+            # Configurar cliente com timeout e configurações SSL mais flexíveis
+            ssl_context = ssl.create_default_context()
+            ssl_context.check_hostname = False
+            ssl_context.verify_mode = ssl.CERT_NONE
+            
+            with httpx.Client(
+                headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'},
+                timeout=30.0,
+                verify=ssl_context,
+                follow_redirects=True
+            ) as client:
+                response = client.get(url)
+                response.raise_for_status()
+                return response.content
+                
+        except (httpx.ConnectError, httpx.TimeoutException, ssl.SSLError) as e:
+            logger.warning(f"Tentativa {attempt + 1}/{max_retries} falhou: {e}")
+            if attempt == max_retries - 1:
+                raise
+            time.sleep(2 ** attempt)  # Backoff exponencial
+        except Exception as e:
+            logger.error(f"Erro inesperado ao acessar {url}: {e}")
+            raise
+
+try:
+    raw_html = get_html_with_retry(base_url)
+except Exception as e:
+    logger.error(f"Erro fatal ao acessar a URL {base_url}: {e}")
+    print(f"\n❌ Erro ao acessar a página da Receita Federal.")
+    print(f"URL tentada: {base_url}")
+    print(f"Erro: {e}")
+    print("\n🔍 Verificações:")
+    print("1. Confirme se o ano/mês estão corretos")
+    print("2. Verifique sua conexão com a internet")
+    print("3. Tente novamente em alguns minutos")
+    sys.exit(1)
 
 # Formatar página e converter em string
 page_items = bs.BeautifulSoup(raw_html, 'lxml')
@@ -306,28 +409,49 @@ for i in range(0, len(Items)):
 @retry(stop=stop_after_attempt(5), wait=wait_exponential(multiplier=1, min=4, max=10))
 async def download_file_async(url, file_path, semaphore):
     """Download file asynchronously with retry logic using httpx"""
+    import ssl
+    
     async with semaphore:  # Limita downloads simultâneos
-        headers = {'User-Agent': 'Mozilla/5.0'}
+        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
         
-        async with httpx.AsyncClient(headers=headers, timeout=60.0) as client:
-            async with client.stream('GET', url) as response:
-                response.raise_for_status()
-                
-                total_size = int(response.headers.get('content-length', 0))
-                downloaded = 0
-                
-                with open(file_path, 'wb') as f:
-                    async for chunk in response.aiter_bytes(chunk_size=65536):  # Chunks maiores para melhor performance
-                        f.write(chunk)
-                        downloaded += len(chunk)
-                        
-                        if total_size > 0:
-                            percent = (downloaded / total_size) * 100
-                            file_name = os.path.basename(file_path)
-                            sys.stdout.write(f'\r{file_name}: {percent:.1f}% [{downloaded:,}/{total_size:,}] bytes')
-                            sys.stdout.flush()
-                
-                print(f'\n{os.path.basename(file_path)} baixado com sucesso!')
+        # Configurar SSL mais permissivo para downloads
+        ssl_context = ssl.create_default_context()
+        ssl_context.check_hostname = False
+        ssl_context.verify_mode = ssl.CERT_NONE
+        
+        try:
+            async with httpx.AsyncClient(
+                headers=headers,
+                timeout=120.0,  # Timeout maior para downloads grandes
+                verify=ssl_context,
+                follow_redirects=True,
+                limits=httpx.Limits(max_keepalive_connections=5, max_connections=10)
+            ) as client:
+                async with client.stream('GET', url) as response:
+                    response.raise_for_status()
+                    
+                    total_size = int(response.headers.get('content-length', 0))
+                    downloaded = 0
+                    
+                    with open(file_path, 'wb') as f:
+                        async for chunk in response.aiter_bytes(chunk_size=65536):  # Chunks maiores para melhor performance
+                            f.write(chunk)
+                            downloaded += len(chunk)
+                            
+                            if total_size > 0:
+                                percent = (downloaded / total_size) * 100
+                                file_name = os.path.basename(file_path)
+                                sys.stdout.write(f'\r{file_name}: {percent:.1f}% [{downloaded:,}/{total_size:,}] bytes')
+                                sys.stdout.flush()
+                    
+                    print(f'\n{os.path.basename(file_path)} baixado com sucesso!')
+        
+        except (httpx.ConnectError, httpx.TimeoutException, ssl.SSLError) as e:
+            logger.error(f'Erro de conexão ao baixar {os.path.basename(file_path)}: {e}')
+            raise
+        except Exception as e:
+            logger.error(f'Erro inesperado ao baixar {os.path.basename(file_path)}: {e}')
+            raise
 
 
 async def download_all_files():
@@ -956,26 +1080,124 @@ async def create_indexes(pool):
     '''
     Cria índices nas tabelas de forma assíncrona com timeout maior
     '''
-    print("Criando índices...")
+    console.print("\n[bold yellow]🔨 [FASE 4] Criando índices para otimização de consultas...[/bold yellow]")
     
+    # Lista completa de índices baseada no script create_indexes.py
     indexes = [
-        "CREATE INDEX IF NOT EXISTS empresa_cnpj ON empresa(cnpj_basico);",
-        "CREATE INDEX IF NOT EXISTS estabelecimento_cnpj ON estabelecimento(cnpj_basico);",
-        "CREATE INDEX IF NOT EXISTS socios_cnpj ON socios(cnpj_basico);",
-        "CREATE INDEX IF NOT EXISTS simples_cnpj ON simples(cnpj_basico);"
+        {
+            'name': 'empresa_cnpj',
+            'table': 'empresa',
+            'columns': 'cnpj_basico',
+            'sql': 'CREATE INDEX IF NOT EXISTS empresa_cnpj ON empresa(cnpj_basico);'
+        },
+        {
+            'name': 'estabelecimento_cnpj',
+            'table': 'estabelecimento', 
+            'columns': 'cnpj_basico',
+            'sql': 'CREATE INDEX IF NOT EXISTS estabelecimento_cnpj ON estabelecimento(cnpj_basico);'
+        },
+        {
+            'name': 'estabelecimento_cnpj_completo',
+            'table': 'estabelecimento',
+            'columns': 'cnpj_basico, cnpj_ordem, cnpj_dv',
+            'sql': 'CREATE INDEX IF NOT EXISTS estabelecimento_cnpj_completo ON estabelecimento(cnpj_basico, cnpj_ordem, cnpj_dv);'
+        },
+        {
+            'name': 'socios_cnpj',
+            'table': 'socios',
+            'columns': 'cnpj_basico',
+            'sql': 'CREATE INDEX IF NOT EXISTS socios_cnpj ON socios(cnpj_basico);'
+        },
+        {
+            'name': 'simples_cnpj',
+            'table': 'simples',
+            'columns': 'cnpj_basico',
+            'sql': 'CREATE INDEX IF NOT EXISTS simples_cnpj ON simples(cnpj_basico);'
+        },
+        {
+            'name': 'estabelecimento_situacao',
+            'table': 'estabelecimento',
+            'columns': 'situacao_cadastral',
+            'sql': 'CREATE INDEX IF NOT EXISTS estabelecimento_situacao ON estabelecimento(situacao_cadastral);'
+        },
+        {
+            'name': 'estabelecimento_municipio',
+            'table': 'estabelecimento',
+            'columns': 'municipio',
+            'sql': 'CREATE INDEX IF NOT EXISTS estabelecimento_municipio ON estabelecimento(municipio);'
+        }
     ]
     
-    async with pool.acquire() as conn:
-        for index_sql in indexes:
-            try:
-                print(f"Criando índice: {index_sql}")
-                await conn.execute(index_sql)
-                print("✓ Índice criado com sucesso!")
-            except Exception as e:
-                print(f"✗ Erro ao criar índice: {e}")
-                continue
+    created_count = 0
+    failed_count = 0
+    skipped_count = 0
     
-    print("Processo de criação de índices concluído!")
+    with Progress(
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(),
+        MofNCompleteColumn(),
+        TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
+        TimeElapsedColumn(),
+        TimeRemainingColumn(),
+        console=console
+    ) as progress:
+        
+        index_task = progress.add_task("Criando índices", total=len(indexes))
+        
+        async with pool.acquire() as conn:
+            # Configurar timeout maior para criação de índices
+            await conn.execute("SET statement_timeout = '3600000';")  # 1 hora
+            await conn.execute("SET lock_timeout = '3600000';")
+            
+            for index_info in indexes:
+                try:
+                    # Verificar se a tabela existe
+                    table_exists = await conn.fetchval(
+                        "SELECT EXISTS(SELECT 1 FROM information_schema.tables WHERE table_name = $1)",
+                        index_info['table']
+                    )
+                    
+                    if not table_exists:
+                        logger.warning(f"Tabela {index_info['table']} não encontrada, pulando índice {index_info['name']}")
+                        skipped_count += 1
+                        progress.update(index_task, advance=1)
+                        continue
+                    
+                    # Verificar se o índice já existe
+                    index_exists = await conn.fetchval(
+                        "SELECT EXISTS(SELECT 1 FROM pg_indexes WHERE indexname = $1)",
+                        index_info['name']
+                    )
+                    
+                    if index_exists:
+                        logger.info(f"Índice {index_info['name']} já existe")
+                        skipped_count += 1
+                        progress.update(index_task, advance=1)
+                        continue
+                    
+                    # Obter tamanho da tabela
+                    table_size = await conn.fetchval(f"SELECT COUNT(*) FROM {index_info['table']}")
+                    
+                    logger.info(f"Criando índice {index_info['name']} na tabela {index_info['table']} ({table_size:,} registros)")
+                    
+                    start_time = time.time()
+                    await conn.execute(index_info['sql'])
+                    elapsed_time = time.time() - start_time
+                    
+                    logger.info(f"Índice {index_info['name']} criado com sucesso em {elapsed_time:.1f}s")
+                    created_count += 1
+                    
+                except Exception as e:
+                    logger.error(f"Erro ao criar índice {index_info['name']}: {e}")
+                    failed_count += 1
+                
+                progress.update(index_task, advance=1)
+    
+    console.print(f"\n[green]✅ Criação de índices concluída![/green]")
+    console.print(f"[green]  • Índices criados: {created_count}[/green]")
+    console.print(f"[blue]  • Índices já existentes: {skipped_count}[/blue]")
+    if failed_count > 0:
+        console.print(f"[red]  • Índices com erro: {failed_count}[/red]")
 
 
 async def main():
@@ -1042,9 +1264,9 @@ async def main():
             
             await process_outros_arquivos(pool)
             
-            # Criar índices (opcional - pode ser feito separadamente)
-            print("\n[INFO] Criação de índices desabilitada para evitar timeout.")
-            print("[INFO] Execute o script 'create_indexes.py' separadamente para criar os índices.")
+            # Criar índices automaticamente
+            save_checkpoint('creating_indexes')
+            await create_indexes(pool)
             
             # Limpar checkpoint após conclusão bem-sucedida
             clear_checkpoint()
