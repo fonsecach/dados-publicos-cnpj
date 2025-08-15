@@ -199,8 +199,8 @@ async def to_sql_async(dataframe, pool, table_name, batch_size=2600):
     sys.stdout.write('\n')
 
 
-def getEnv(env):
-    return os.getenv(env)
+def getEnv(env, default=None):
+    return os.getenv(env, default)
 
 
 # Carregar variáveis de ambiente automaticamente
@@ -492,10 +492,20 @@ async def extract_all_files():
             full_path = os.path.join(output_files, file_name)
             if not os.path.exists(full_path):
                 return f'Arquivo {file_name} não encontrado'
-                
-            with zipfile.ZipFile(full_path, 'r') as zip_ref:
-                zip_ref.extractall(extracted_files)
-            return f'✓ {file_name} extraído'
+            
+            # Verificar integridade do arquivo ZIP
+            try:
+                with zipfile.ZipFile(full_path, 'r') as zip_ref:
+                    # Testar integridade do arquivo
+                    bad_file = zip_ref.testzip()
+                    if bad_file:
+                        return f'✗ Arquivo corrompido {file_name}: {bad_file} inválido'
+                    
+                    # Extrair arquivos
+                    zip_ref.extractall(extracted_files)
+                return f'✓ {file_name} extraído'
+            except zipfile.BadZipFile:
+                return f'✗ Arquivo corrompido {file_name}: não é um ZIP válido'
         except Exception as e:
             return f'✗ Erro ao extrair {file_name}: {e}'
     
@@ -521,18 +531,37 @@ async def create_database_if_not_exists():
     host = getEnv('DB_HOST')
     port = getEnv('DB_PORT')
     database = getEnv('DB_NAME')
-    ssl_mode = getEnv('DB_SSL_MODE', 'prefer')
+    ssl_mode = getEnv('DB_SSL_MODE', 'disable')
+    
+    # Converter string SSL mode para valor booleano/None esperado pelo asyncpg
+    ssl_config = None
+    if ssl_mode.lower() in ['disable', 'false']:
+        ssl_config = False
+    elif ssl_mode.lower() in ['require', 'true']:
+        ssl_config = True
+    else:
+        ssl_config = 'prefer'  # padrão do asyncpg
     
     # Conectar ao banco padrão postgres para criar o banco se necessário
     try:
-        conn = await asyncpg.connect(
-            user=user,
-            password=passw,
-            database='postgres',
-            host=host,
-            port=port,
-            ssl=ssl_mode
-        )
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                conn = await asyncpg.connect(
+                    user=user,
+                    password=passw,
+                    database='postgres',
+                    host=host,
+                    port=port,
+                    ssl=ssl_config,
+                    timeout=30
+                )
+                break
+            except (ConnectionResetError, asyncpg.exceptions.ConnectionDoesNotExistError) as e:
+                if attempt == max_retries - 1:
+                    raise
+                logger.warning(f"Tentativa {attempt + 1}/{max_retries} falhou: {e}. Tentando novamente em 2s...")
+                await asyncio.sleep(2)
         
         # Verificar se o banco existe
         exists = await conn.fetchval(
@@ -562,7 +591,16 @@ async def create_db_pool():
     host = getEnv('DB_HOST')
     port = getEnv('DB_PORT')
     database = getEnv('DB_NAME')
-    ssl_mode = getEnv('DB_SSL_MODE', 'prefer')
+    ssl_mode = getEnv('DB_SSL_MODE', 'disable')
+    
+    # Converter string SSL mode para valor booleano/None esperado pelo asyncpg
+    ssl_config = None
+    if ssl_mode.lower() in ['disable', 'false']:
+        ssl_config = False
+    elif ssl_mode.lower() in ['require', 'true']:
+        ssl_config = True
+    else:
+        ssl_config = 'prefer'  # padrão do asyncpg
     
     return await asyncpg.create_pool(
         user=user,
@@ -570,10 +608,10 @@ async def create_db_pool():
         database=database,
         host=host,
         port=port,
-        ssl=ssl_mode,
-        min_size=10,
-        max_size=20,
-        command_timeout=500,
+        ssl=ssl_config,
+        min_size=5,
+        max_size=10,
+        command_timeout=300,
         server_settings={
             'client_encoding': 'utf8',
             'timezone': 'UTC'
