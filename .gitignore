@@ -132,6 +132,23 @@ dmypy.json
 *.tmp
 
 data/
+dados/
 code/
 .claude/
 receita_federal_sql_20250716_161005.sql
+
+# ETL temporary files
+*.log
+etl_log.log
+checkpoint.json
+temp/
+downloads/
+extracted/
+
+# Large data files
+*.zip
+*.csv
+*.CSV
+
+# Database dumps
+*.sql

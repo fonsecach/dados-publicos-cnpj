@@ -9,8 +9,9 @@ services:
       - POSTGRESQL_USERNAME=postgres
       - POSTGRESQL_PASSWORD=Li9Q3sDeofmTdO0sOwinx68yA452aksh
       - POSTGRESQL_ROOT_PASSWORD=Li9Q3sDeofmTdO0sOwinx68yA452aksh
+      - POSTGRESQL_PORT_NUMBER=5432
     ports:
-      - "5436:5436"
+      - "5436:5432"
     volumes:
       - postgres_data:/bitnami/postgresql
       - ./code/banco_de_dados.sql:/docker-entrypoint-initdb.d/init.sql
