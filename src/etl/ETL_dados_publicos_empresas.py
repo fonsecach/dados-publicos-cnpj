@@ -521,6 +521,7 @@ async def create_database_if_not_exists():
     host = getEnv('DB_HOST')
     port = getEnv('DB_PORT')
     database = getEnv('DB_NAME')
+    ssl_mode = getEnv('DB_SSL_MODE', 'prefer')
     
     # Conectar ao banco padrão postgres para criar o banco se necessário
     try:
@@ -529,7 +530,8 @@ async def create_database_if_not_exists():
             password=passw,
             database='postgres',
             host=host,
-            port=port
+            port=port,
+            ssl=ssl_mode
         )
         
         # Verificar se o banco existe
@@ -560,6 +562,7 @@ async def create_db_pool():
     host = getEnv('DB_HOST')
     port = getEnv('DB_PORT')
     database = getEnv('DB_NAME')
+    ssl_mode = getEnv('DB_SSL_MODE', 'prefer')
     
     return await asyncpg.create_pool(
         user=user,
@@ -567,6 +570,7 @@ async def create_db_pool():
         database=database,
         host=host,
         port=port,
+        ssl=ssl_mode,
         min_size=10,
         max_size=20,
         command_timeout=500,
