@@ -75,10 +75,38 @@ psql -U postgres -d receita_federal -f src/sql/banco_de_dados.sql
 ```
 
 ### 4. **Execução**
-```bash
-# Executar ETL completo
-uv run src/etl/ETL_dados_publicos_empresas.py
 
+#### 🎯 Modos de Execução do ETL
+
+O ETL suporta **3 modos de operação**:
+
+**a) Modo Interativo (padrão):**
+```bash
+# Solicita ano/mês interativamente
+uv run src/etl/ETL_dados_publicos_empresas.py
+```
+
+**b) Modo Automático (versão mais recente):**
+```bash
+# Detecta e baixa automaticamente a versão mais recente da Receita Federal
+uv run src/etl/ETL_dados_publicos_empresas.py --last
+```
+
+**c) Modo Específico (data customizada):**
+```bash
+# Baixa uma versão específica (formato: MM-AAAA)
+uv run src/etl/ETL_dados_publicos_empresas.py 01-2025
+uv run src/etl/ETL_dados_publicos_empresas.py 12-2024
+```
+
+**Ver ajuda:**
+```bash
+uv run src/etl/ETL_dados_publicos_empresas.py --help
+```
+
+#### 📋 Processos Complementares
+
+```bash
 # Validar dados
 uv run src/validation/check_database_status.py
 

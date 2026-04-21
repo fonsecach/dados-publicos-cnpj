@@ -1,26 +1,23 @@
-version: '3.8'
-
 services:
   postgres:
-    image: bitnami/postgresql:17
+    image: docker.io/postgres:16-alpine
     container_name: receita_postgres
     environment:
-      - POSTGRESQL_DATABASE=receita_cnpj
-      - POSTGRESQL_USERNAME=postgres
-      - POSTGRESQL_PASSWORD=Li9Q3sDeofmTdO0sOwinx68yA452aksh
-      - POSTGRESQL_ROOT_PASSWORD=Li9Q3sDeofmTdO0sOwinx68yA452aksh
-      - POSTGRESQL_PORT_NUMBER=5432
+      POSTGRES_DB: ${DB_NAME:-receita_federal}
+      POSTGRES_USER: ${DB_USER:-postgres}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:?DB_PASSWORD nao configurado no .env}
+      PGDATA: /var/lib/postgresql/data/pgdata
     ports:
-      - "5436:5432"
+      - "${DB_PORT:-5436}:5432"
     volumes:
-      - postgres_data:/bitnami/postgresql
-      - ./code/banco_de_dados.sql:/docker-entrypoint-initdb.d/init.sql
+      - postgres_data:/var/lib/postgresql/data
     restart: unless-stopped
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres -d receita_cnpj"]
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-postgres} -d ${DB_NAME:-receita_federal}"]
       interval: 30s
       timeout: 10s
       retries: 5
+    shm_size: 256mb
 
 volumes:
   postgres_data:

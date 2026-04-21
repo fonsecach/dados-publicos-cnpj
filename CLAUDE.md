@@ -7,13 +7,18 @@ Este documento detalha as melhorias implementadas no sistema ETL de dados públi
 ## 🛠️ Melhorias Técnicas Implementadas
 
 ### 1. **Sistema de Seleção Dinâmica de Data** 🗓️
-- **Funcionalidade**: Interface interativa para seleção de ano/mês dos dados
-- **Implementação**: Função `get_year_month()` com validação robusta
+- **Funcionalidade**: Múltiplos modos de seleção de ano/mês dos dados
+- **Implementação**: Função `get_year_month()` com suporte a argumentos CLI e validação robusta
+- **Modos de operação**:
+  - **Interativo** (padrão): Interface interativa para seleção manual
+  - **Automático** (`--last`): Detecta e baixa a versão mais recente disponível na Receita Federal
+  - **Específico** (`MM-AAAA`): Baixa uma versão específica via linha de comando
 - **Benefícios**:
   - Usuário pode escolher qualquer mês/ano disponível (2019 - atual)
   - Validação automática de entrada
   - URL construída dinamicamente: `{ano}-{mes:02d}`
-  - Valores padrão baseados na data atual
+  - Detecção automática da versão mais recente via scraping
+  - Suporte completo a automação via scripts e CI/CD
 
 ### 2. **Tratamento Robusto de Conexões SSL/TLS** 🔐
 - **Problema Original**: Falhas de conexão com certificados SSL da Receita Federal
@@ -53,8 +58,27 @@ docker ps | grep postgres
 ```
 
 ### Executar ETL
+
+**Modo Interativo (padrão):**
 ```bash
 uv run src/etl/ETL_dados_publicos_empresas.py
+```
+
+**Baixar a versão mais recente automaticamente:**
+```bash
+uv run src/etl/ETL_dados_publicos_empresas.py --last
+```
+
+**Baixar uma versão específica:**
+```bash
+# Formato: MM-AAAA
+uv run src/etl/ETL_dados_publicos_empresas.py 01-2025
+uv run src/etl/ETL_dados_publicos_empresas.py 12-2024
+```
+
+**Ver ajuda e exemplos:**
+```bash
+uv run src/etl/ETL_dados_publicos_empresas.py --help
 ```
 
 ## 📊 Impacto das Melhorias
@@ -69,7 +93,9 @@ uv run src/etl/ETL_dados_publicos_empresas.py
 - ✅ Conexões SSL robustas com retry automático
 - ✅ Downloads funcionando com configuração otimizada
 - ✅ Extrações funcionais com caminhos corretos
-- ✅ Seleção interativa de ano/mês
+- ✅ Seleção interativa, automática ou via CLI de ano/mês
+- ✅ Detecção automática da versão mais recente (`--last`)
+- ✅ Suporte a automação via argumentos de linha de comando
 - ✅ Tratamento gracioso de erros com mensagens informativas
 
 ## 🔧 Configuração Recomendada
@@ -112,8 +138,42 @@ EXTRACTED_FILES_PATH=./dados/extracted
 - **Padrão de SSL**: Permissivo para contornar limitações dos servidores governamentais
 - **Logs**: Rich console com formatação colorida e progress bars
 
+## 🎯 Casos de Uso
+
+### 1. Automação em Cron/Scheduler
+Para baixar automaticamente a versão mais recente todo mês:
+```bash
+# Crontab: Todo dia 5 do mês às 2h da manhã
+0 2 5 * * cd /path/to/projeto && uv run src/etl/ETL_dados_publicos_empresas.py --last
+```
+
+### 2. CI/CD Pipeline
+```yaml
+# GitHub Actions / GitLab CI
+- name: Download CNPJ Data
+  run: |
+    uv run src/etl/ETL_dados_publicos_empresas.py --last
+```
+
+### 3. Análise Histórica
+Para comparar dados de períodos específicos:
+```bash
+# Baixar dados de janeiro de 2025
+uv run src/etl/ETL_dados_publicos_empresas.py 01-2025
+
+# Baixar dados de dezembro de 2024
+uv run src/etl/ETL_dados_publicos_empresas.py 12-2024
+```
+
+### 4. Desenvolvimento e Testes
+Para testes locais com versões específicas:
+```bash
+# Modo interativo permite escolha manual
+uv run src/etl/ETL_dados_publicos_empresas.py
+```
+
 ---
 
 **🤖 Gerado com Claude Code**  
-Data: 2025-08-15  
-Versão: ETL v2.1 com melhorias SSL e interface interativa
+Data: 2026-01-29  
+Versão: ETL v2.2 com argumentos CLI e detecção automática

@@ -3,7 +3,7 @@ name = "receita-federal-do-brasil-dados-publicos-cnpj"
 version = "0.1.0"
 description = "ETL para download e processamento dos dados públicos da Receita Federal - CNPJ"
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = "==3.13.*"
 dependencies = [
     "httpx>=0.27.0",
     "beautifulsoup4>=4.12.0",
