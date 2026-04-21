@@ -299,74 +299,87 @@ Exemplos de uso:
     return parser.parse_args()
 
 
+SHARE_TOKEN = "YggdBLfdninEJX9"
+WEBDAV_BASE_URL = f"https://arquivos.receitafederal.gov.br/public.php/webdav"
+
+
+def webdav_list(path="/"):
+    """Lista entradas de um diretório via API WebDAV do Nextcloud."""
+    import base64
+    import ssl
+    import xml.etree.ElementTree as ET
+
+    ssl_context = ssl.create_default_context()
+    ssl_context.check_hostname = False
+    ssl_context.verify_mode = ssl.CERT_NONE
+
+    credentials = base64.b64encode(f"{SHARE_TOKEN}:".encode()).decode()
+    url = WEBDAV_BASE_URL + path
+
+    with httpx.Client(
+        headers={
+            "Authorization": f"Basic {credentials}",
+            "Depth": "1",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        },
+        timeout=30.0,
+        verify=ssl_context,
+        follow_redirects=True,
+    ) as client:
+        response = client.request(
+            "PROPFIND",
+            url,
+            content='<?xml version="1.0"?><d:propfind xmlns:d="DAV:"><d:prop><d:displayname/></d:prop></d:propfind>',
+        )
+        response.raise_for_status()
+
+    root = ET.fromstring(response.content)
+    ns = {"d": "DAV:"}
+    entries = []
+    for resp in root.findall("d:response", ns):
+        href = resp.find("d:href", ns)
+        if href is None:
+            continue
+        name = href.text.rstrip("/").split("/")[-1]
+        # Ignorar a própria entrada do diretório pai
+        parent = path.strip("/")
+        if name and name != parent and name != SHARE_TOKEN:
+            entries.append(name)
+    return entries
+
+
 def get_latest_available_date():
     """
-    Detecta a versão mais recente disponível na Receita Federal
-    fazendo scraping da página principal
+    Detecta a versão mais recente disponível na Receita Federal via WebDAV.
     """
-    import ssl
-
-    base_listing_url = (
-        "https://arquivos.receitafederal.gov.br/index.php/s/YggdBLfdninEJX9"
-    )
-
     console.print(
         "[yellow]🔍 Detectando a versão mais recente disponível na Receita Federal...[/yellow]"
     )
 
     try:
-        ssl_context = ssl.create_default_context()
-        ssl_context.check_hostname = False
-        ssl_context.verify_mode = ssl.CERT_NONE
+        entries = webdav_list("/")
+        matches = [e for e in entries if re.match(r"^\d{4}-\d{2}$", e)]
 
-        with httpx.Client(
-            headers={
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-            },
-            timeout=30.0,
-            verify=ssl_context,
-            follow_redirects=True,
-        ) as client:
-            response = client.get(base_listing_url)
-            response.raise_for_status()
+        if not matches:
+            raise ValueError("Nenhuma versão encontrada na página da Receita Federal")
 
-            # Parse HTML para encontrar diretórios no formato AAAA-MM
-            page = bs.BeautifulSoup(response.content, "lxml")
-            html_str = str(page)
+        matches.sort(reverse=True)
+        latest = matches[0]
 
-            # Procurar por padrões de diretórios AAAA-MM (Nextcloud: data-file ou JSON)
-            matches = re.findall(r'data-file="(\d{4}-\d{2})"', html_str)
-            if not matches:
-                matches = re.findall(r'"basename":"(\d{4}-\d{2})"', html_str)
-            if not matches:
-                matches = re.findall(r'"filename":"(\d{4}-\d{2})"', html_str)
-            if not matches:
-                matches = re.findall(r'href="[^"]*dir=%2F(\d{4}-\d{2})[^"]*"', html_str)
+        year, month = latest.split("-")
+        year = int(year)
+        month = int(month)
 
-            if not matches:
-                raise ValueError(
-                    "Nenhuma versão encontrada na página da Receita Federal"
-                )
-
-            # Ordenar e pegar a mais recente
-            matches.sort(reverse=True)
-            latest = matches[0]
-
-            year, month = latest.split("-")
-            year = int(year)
-            month = int(month)
-
-            console.print(
-                f"[green]✅ Versão mais recente encontrada: {month:02d}-{year}[/green]"
-            )
-            return year, month
+        console.print(
+            f"[green]✅ Versão mais recente encontrada: {month:02d}-{year}[/green]"
+        )
+        return year, month
 
     except Exception as e:
         logger.error(f"Erro ao detectar versão mais recente: {e}")
         console.print(f"[red]❌ Erro ao detectar versão mais recente: {e}[/red]")
         console.print("[yellow]⚠️  Usando mês anterior como fallback[/yellow]")
 
-        # Fallback para mês anterior (mais provável de estar disponível)
         now = datetime.datetime.now()
         if now.month == 1:
             return now.year - 1, 12
@@ -478,10 +491,7 @@ print(f"\n✅ Configurado para baixar dados de: {ano}-{mes_formatado}")
 print("=" * 50)
 
 # URL base do compartilhamento Nextcloud da Receita Federal
-SHARE_BASE_URL = "https://arquivos.receitafederal.gov.br/index.php/s/YggdBLfdninEJX9"
-
-# URL de listagem dos arquivos do mês selecionado
-base_url = f"{SHARE_BASE_URL}?dir=/{ano}-{mes_formatado}"
+SHARE_BASE_URL = f"https://arquivos.receitafederal.gov.br/index.php/s/{SHARE_TOKEN}"
 
 # Read details from ".env" file:
 output_files = None
@@ -543,31 +553,18 @@ def get_html_with_retry(url, max_retries=3):
 
 
 try:
-    raw_html = get_html_with_retry(base_url)
+    all_entries = webdav_list(f"/{ano}-{mes_formatado}")
+    Files = [e for e in all_entries if e.lower().endswith(".zip")]
 except Exception as e:
-    logger.error(f"Erro fatal ao acessar a URL {base_url}: {e}")
-    print(f"\n❌ Erro ao acessar a página da Receita Federal.")
-    print(f"URL tentada: {base_url}")
+    logger.error(f"Erro fatal ao listar arquivos via WebDAV: {e}")
+    print(f"\n❌ Erro ao listar arquivos da Receita Federal via WebDAV.")
+    print(f"Diretório tentado: /{ano}-{mes_formatado}")
     print(f"Erro: {e}")
     print("\n🔍 Verificações:")
     print("1. Confirme se o ano/mês estão corretos")
     print("2. Verifique sua conexão com a internet")
     print("3. Tente novamente em alguns minutos")
     sys.exit(1)
-
-# Formatar página e converter em string
-page_items = bs.BeautifulSoup(raw_html, "lxml")
-html_str = str(page_items)
-
-# Obter arquivos - Nextcloud: tenta data-file, depois JSON, depois links de download
-Files = re.findall(r'data-file="([^"]+\.zip)"', html_str)
-if not Files:
-    Files = re.findall(r'"basename":"([^"]+\.zip)"', html_str)
-if not Files:
-    Files = re.findall(r'"filename":"([^"]+\.zip)"', html_str)
-if not Files:
-    # Fallback: extrai nomes dos links de download ?files=NOME.zip
-    Files = re.findall(r'[?&]files=([^"&]+\.zip)', html_str)
 
 print("Arquivos que serão baixados:")
 for l in Files:
@@ -588,25 +585,26 @@ arquivos_pais = []
 arquivos_quals = []
 
 for i in range(0, len(Items)):
-    if Items[i].find("EMPRECSV") > -1:
+    name_upper = Items[i].upper()
+    if "EMPRECSV" in name_upper or "EMPRESAS" in name_upper:
         arquivos_empresa.append(Items[i])
-    elif Items[i].find("ESTABELE") > -1:
+    elif "ESTABELE" in name_upper or "ESTABELECIMENTOS" in name_upper:
         arquivos_estabelecimento.append(Items[i])
-    elif Items[i].find("SOCIOCSV") > -1:
+    elif "SOCIOCSV" in name_upper or "SOCIOS" in name_upper:
         arquivos_socios.append(Items[i])
-    elif Items[i].find("SIMPLES.") > -1:
+    elif "SIMPLES" in name_upper:
         arquivos_simples.append(Items[i])
-    elif Items[i].find("CNAECSV") > -1:
+    elif "CNAECSV" in name_upper or "CNAES" in name_upper:
         arquivos_cnae.append(Items[i])
-    elif Items[i].find("MOTICSV") > -1:
+    elif "MOTICSV" in name_upper or "MOTIVOS" in name_upper:
         arquivos_moti.append(Items[i])
-    elif Items[i].find("MUNICCSV") > -1:
+    elif "MUNICCSV" in name_upper or "MUNICIPIOS" in name_upper:
         arquivos_munic.append(Items[i])
-    elif Items[i].find("NATJUCSV") > -1:
+    elif "NATJUCSV" in name_upper or "NATUREZAS" in name_upper:
         arquivos_natju.append(Items[i])
-    elif Items[i].find("PAISCSV") > -1:
+    elif "PAISCSV" in name_upper or "PAISES" in name_upper:
         arquivos_pais.append(Items[i])
-    elif Items[i].find("QUALSCSV") > -1:
+    elif "QUALSCSV" in name_upper or "QUALIFICACOES" in name_upper:
         arquivos_quals.append(Items[i])
     else:
         pass
