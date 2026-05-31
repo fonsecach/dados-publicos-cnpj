@@ -1664,6 +1664,9 @@ async def main():
     """
     Função principal que executa todo o processo de ETL de forma assíncrona
     """
+    _project_root = str(pathlib.Path(__file__).resolve().parent.parent.parent)
+    if _project_root not in sys.path:
+        sys.path.insert(0, _project_root)
     from src.blue_green.state import StateManager
 
     console.print("\n[bold magenta]" + "=" * 50 + "[/bold magenta]")
@@ -1681,6 +1684,15 @@ async def main():
     logger.info("Processo ETL iniciado")
 
     try:
+        # Limpeza das pastas de trabalho antes de cada execução
+        import shutil
+        for _folder in [output_files, extracted_files]:
+            if _folder and os.path.isdir(_folder):
+                shutil.rmtree(_folder)
+                logger.info(f"Pasta limpa: {_folder}")
+            if _folder:
+                makedirs(_folder)
+
         # Fase 1: Download paralelo
         console.print(
             "\n[bold yellow]📥 [FASE 1] Download dos arquivos...[/bold yellow]"
