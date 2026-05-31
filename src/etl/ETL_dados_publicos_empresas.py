@@ -53,6 +53,7 @@ def check_diff(url, file_name):
     if not os.path.isfile(file_name):
         return True  # ainda nao foi baixado
 
+    import base64
     import ssl
 
     try:
@@ -61,9 +62,11 @@ def check_diff(url, file_name):
         ssl_context.check_hostname = False
         ssl_context.verify_mode = ssl.CERT_NONE
 
+        credentials = base64.b64encode(f"{SHARE_TOKEN}:".encode()).decode()
         with httpx.Client(
             headers={
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+                "Authorization": f"Basic {credentials}",
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
             },
             timeout=30.0,
             verify=ssl_context,
@@ -623,8 +626,11 @@ async def download_file_async(url, file_path, semaphore):
     import ssl
 
     async with semaphore:  # Limita downloads simultâneos
+        import base64
+        credentials = base64.b64encode(f"{SHARE_TOKEN}:".encode()).decode()
         headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+            "Authorization": f"Basic {credentials}",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
         }
 
         # Configurar SSL mais permissivo para downloads
@@ -683,7 +689,7 @@ async def download_all_files():
     download_semaphore = asyncio.Semaphore(3)  # Máximo 3 downloads simultâneos
 
     async def download_single_file(file_name):
-        url = f"{SHARE_BASE_URL}/download?path=/{ano}-{mes_formatado}&files={file_name}"
+        url = f"{WEBDAV_BASE_URL}/{ano}-{mes_formatado}/{file_name}"
         file_path = os.path.join(output_files, file_name)
 
         if check_diff(url, file_path):
