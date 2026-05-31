@@ -296,6 +296,13 @@ Exemplos de uso:
         help="Baixar a versão mais recente disponível na Receita Federal",
     )
 
+    parser.add_argument(
+        "--db-target",
+        default="receita_federal_staging",
+        dest="db_target",
+        help="Banco de dados destino para a carga (padrão: receita_federal_staging)",
+    )
+
     return parser.parse_args()
 
 
@@ -739,7 +746,7 @@ async def extract_all_files():
     print("Extração concluída!")
 
 
-async def create_database_if_not_exists():
+async def create_database_if_not_exists(db_name: str = None):
     """
     Cria o banco de dados se não existir
     """
@@ -747,7 +754,7 @@ async def create_database_if_not_exists():
     passw = getEnv("DB_PASSWORD")
     host = getEnv("DB_HOST")
     port = getEnv("DB_PORT")
-    database = getEnv("DB_NAME")
+    database = db_name or getEnv("DB_NAME")
     ssl_mode = getEnv("DB_SSL_MODE", "disable")
 
     # Converter string SSL mode para valor booleano/None esperado pelo asyncpg
@@ -806,7 +813,7 @@ async def create_database_if_not_exists():
         raise
 
 
-async def create_db_pool():
+async def create_db_pool(db_name: str = None):
     """
     Cria pool de conexões assíncronas com o PostgreSQL
     """
@@ -814,7 +821,7 @@ async def create_db_pool():
     passw = getEnv("DB_PASSWORD")
     host = getEnv("DB_HOST")
     port = getEnv("DB_PORT")
-    database = getEnv("DB_NAME")
+    database = db_name or getEnv("DB_NAME")
     ssl_mode = getEnv("DB_SSL_MODE", "disable")
 
     # Converter string SSL mode para valor booleano/None esperado pelo asyncpg
@@ -1642,11 +1649,18 @@ async def main():
     """
     Função principal que executa todo o processo de ETL de forma assíncrona
     """
+    from src.blue_green.state import StateManager
+
     console.print("\n[bold magenta]" + "=" * 50 + "[/bold magenta]")
     console.print(
         "[bold magenta]    PROCESSO ETL ASSÍNCRONO INICIADO    [/bold magenta]"
     )
     console.print("[bold magenta]" + "=" * 50 + "[/bold magenta]\n")
+
+    db_target = args.db_target
+    state = StateManager()
+
+    console.print(f"[blue]Destino do banco: {db_target}[/blue]")
 
     start_time = time.time()
     logger.info("Processo ETL iniciado")
@@ -1661,6 +1675,8 @@ async def main():
         download_time = time.time() - download_start
         logger.info(f"Download concluído em {download_time:.1f}s")
         console.print(f"[green]✅ Download concluído em {download_time:.1f}s[/green]")
+
+        state.update_staging_downloaded(source_month=f"{mes:02d}-{ano}")
 
         # Fase 2: Extração paralela
         console.print(
@@ -1679,10 +1695,10 @@ async def main():
         logger.info("Iniciando processamento e inserção no banco")
 
         # Criar banco de dados se não existir
-        await create_database_if_not_exists()
+        await create_database_if_not_exists(db_name=db_target)
 
         # Criar pool de conexões
-        pool = await create_db_pool()
+        pool = await create_db_pool(db_name=db_target)
 
         try:
             # Configurar tabelas
@@ -1731,6 +1747,8 @@ async def main():
             # Criar índices automaticamente
             save_checkpoint("creating_indexes")
             await create_indexes(pool)
+
+            state.update_staging_processed()
 
             # Limpar checkpoint após conclusão bem-sucedida
             clear_checkpoint()
