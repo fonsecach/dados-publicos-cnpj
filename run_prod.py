@@ -73,7 +73,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "date",
         nargs="?",
-        help="Mês no formato MM-AAAA. Se omitido, usa --last automaticamente.",
+        help="Mês no formato MM-AAAA (ex: 01-2025). Se omitido, usa --last.",
+    )
+    parser.add_argument(
+        "--last",
+        action="store_true",
+        help="Baixar a versão mais recente disponível na Receita Federal",
     )
     parser.add_argument(
         "--skip-etl",
@@ -103,6 +108,8 @@ def run_etl(args: argparse.Namespace) -> bool:
     cmd = ["uv", "run", str(etl_script), "--db-target", "receita_federal_staging"]
     if args.date:
         cmd.append(args.date)
+    elif args.last:
+        cmd.append("--last")
     else:
         cmd.append("--last")
 
