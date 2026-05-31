@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-uv """
+"""
 Script de deploy em produção — ciclo completo blue-green:
   1. Executa ETL na staging
   2. Valida staging
