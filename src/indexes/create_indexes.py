@@ -79,7 +79,19 @@ INDEXES = [
         'table': 'estabelecimento',
         'columns': 'municipio',
         'sql': 'CREATE INDEX IF NOT EXISTS estabelecimento_municipio ON estabelecimento(municipio);'
-    }
+    },
+    {
+        'name': 'empresa_razao_social_trgm',
+        'table': 'empresa',
+        'columns': 'razao_social (GIN trgm)',
+        'sql': 'CREATE INDEX IF NOT EXISTS empresa_razao_social_trgm ON empresa USING GIN (razao_social gin_trgm_ops);'
+    },
+    {
+        'name': 'estabelecimento_nome_fantasia_trgm',
+        'table': 'estabelecimento',
+        'columns': 'nome_fantasia (GIN trgm)',
+        'sql': 'CREATE INDEX IF NOT EXISTS estabelecimento_nome_fantasia_trgm ON estabelecimento USING GIN (nome_fantasia gin_trgm_ops);'
+    },
 ]
 
 
@@ -175,7 +187,10 @@ async def main():
         created_count = 0
         failed_count = 0
         skipped_count = 0
-        
+
+        async with pool.acquire() as conn:
+            await conn.execute("CREATE EXTENSION IF NOT EXISTS pg_trgm;")
+
         console.print(f"[bold blue]📋 Total de índices a serem criados: {len(INDEXES)}[/bold blue]\n")
         
         for i, index_info in enumerate(INDEXES, 1):

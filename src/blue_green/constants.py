@@ -19,4 +19,6 @@ EXPECTED_INDEXES = [
     "simples_cnpj",
     "estabelecimento_situacao",
     "estabelecimento_municipio",
+    "empresa_razao_social_trgm",
+    "estabelecimento_nome_fantasia_trgm",
 ]

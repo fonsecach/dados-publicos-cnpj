@@ -1564,6 +1564,18 @@ async def create_indexes(pool):
             "columns": "municipio",
             "sql": "CREATE INDEX IF NOT EXISTS estabelecimento_municipio ON estabelecimento(municipio);",
         },
+        {
+            "name": "empresa_razao_social_trgm",
+            "table": "empresa",
+            "columns": "razao_social (GIN trgm)",
+            "sql": "CREATE INDEX IF NOT EXISTS empresa_razao_social_trgm ON empresa USING GIN (razao_social gin_trgm_ops);",
+        },
+        {
+            "name": "estabelecimento_nome_fantasia_trgm",
+            "table": "estabelecimento",
+            "columns": "nome_fantasia (GIN trgm)",
+            "sql": "CREATE INDEX IF NOT EXISTS estabelecimento_nome_fantasia_trgm ON estabelecimento USING GIN (nome_fantasia gin_trgm_ops);",
+        },
     ]
 
     created_count = 0
@@ -1580,6 +1592,9 @@ async def create_indexes(pool):
         console=console,
     ) as progress:
         index_task = progress.add_task("Criando índices", total=len(indexes))
+
+        async with pool.acquire() as conn:
+            await conn.execute("CREATE EXTENSION IF NOT EXISTS pg_trgm;")
 
         async with pool.acquire() as conn:
             # Configurar timeout maior para criação de índices
