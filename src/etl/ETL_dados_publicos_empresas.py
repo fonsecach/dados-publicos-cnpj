@@ -147,12 +147,12 @@ def clear_checkpoint():
         logger.error(f"Erro ao remover checkpoint: {e}")
 
 
-async def to_sql_async(dataframe, pool, table_name, batch_size=2600):
+async def to_sql_async(dataframe, pool, table_name, batch_size=50000):
     """
-    Insere dados de forma assíncrona usando batch inserts otimizados
+    Insere dados de forma assíncrona usando o protocolo COPY do Postgres
+    (asyncpg.copy_records_to_table) — muito mais rápido que INSERT em lote
+    para as tabelas de fato (estabelecimento, empresa, socios, simples).
     """
-    from datetime import date, datetime
-
     total = len(dataframe)
     columns = list(dataframe.columns)
 
@@ -172,65 +172,36 @@ async def to_sql_async(dataframe, pool, table_name, batch_size=2600):
         ],
     }
 
-    def convert_date_string(date_str):
-        """Converte string de data YYYYMMDD para objeto date"""
-        if (
-            pd.isna(date_str)
-            or date_str == ""
-            or date_str == "00000000"
-            or date_str == "0"
-        ):
-            return None
-        try:
-            if isinstance(date_str, str) and len(date_str) == 8 and date_str.isdigit():
-                return datetime.strptime(date_str, "%Y%m%d").date()
-            return None if isinstance(date_str, str) else date_str
-        except (ValueError, TypeError):
-            return None
+    df = dataframe
+    for col in date_columns.get(table_name, []):
+        if col in df.columns:
+            # "", "0" e "00000000" não casam com %Y%m%d e viram NaT via errors="coerce"
+            df[col] = pd.to_datetime(
+                df[col].astype(str), format="%Y%m%d", errors="coerce"
+            ).dt.date
 
-    # Converter DataFrame para lista de tuplas e substituir NaN por None
-    import numpy as np
+    # Substitui NaN/NaT/pd.NA por None (asyncpg exige None, não os sentinels do pandas)
+    df = df.astype(object).where(pd.notnull(df), None)
+    records = list(df.itertuples(index=False, name=None))
 
-    records = []
-    for row in dataframe.values:
-        clean_row = []
-        for i, val in enumerate(row):
-            if pd.isna(val):
-                clean_row.append(None)
-            elif (
-                table_name in date_columns
-                and i < len(columns)
-                and columns[i] in date_columns[table_name]
-            ):
-                # Converter colunas de data
-                clean_row.append(convert_date_string(val))
-            else:
-                clean_row.append(val)
-        records.append(tuple(clean_row))
-
-    # Criar statement de insert
-    placeholders = ",".join(["$" + str(i + 1) for i in range(len(columns))])
-    insert_sql = (
-        f"INSERT INTO {table_name} ({','.join(columns)}) VALUES ({placeholders})"
-    )
-
-    async def insert_batch(batch_records, batch_num):
+    async def copy_batch(batch_records, batch_num):
         async with pool.acquire() as conn:
-            await conn.executemany(insert_sql, batch_records, timeout=500)
+            await conn.copy_records_to_table(
+                table_name, records=batch_records, columns=columns
+            )
 
         # Progress tracking
-        completed = batch_num * batch_size
-        percent = min((completed * 100) / total, 100)
+        completed = min((batch_num + 1) * batch_size, total)
+        percent = (completed * 100) / total if total else 100
         progress = f"{table_name} {percent:.2f}% {completed:0{len(str(total))}}/{total}"
         sys.stdout.write(f"\r{progress}")
         sys.stdout.flush()
 
     # Processar em batches
-    tasks = []
-    for i in range(0, len(records), batch_size):
-        batch = records[i : i + batch_size]
-        task = insert_batch(batch, i // batch_size)
-        tasks.append(task)
+    tasks = [
+        copy_batch(records[i : i + batch_size], i // batch_size)
+        for i in range(0, len(records), batch_size)
+    ]
 
     # Executar todos os batches em paralelo (limitando concorrência)
     semaphore = asyncio.Semaphore(10)  # Máximo 10 conexões simultâneas
@@ -1181,76 +1152,71 @@ async def process_estabelecimento_files(pool):
             )
             NROWS = 2000000
             part = 0
-            while True:
-                try:
-                    estabelecimento = pd.read_csv(
-                        filepath_or_buffer=extracted_file_path,
-                        sep=";",
-                        nrows=NROWS,
-                        skiprows=NROWS * part,
-                        header=None,
-                        dtype=estabelecimento_dtypes,
-                        encoding="latin-1",
-                    )
-                except pd.errors.EmptyDataError:
-                    logger.info(
-                        f"Fim do arquivo {arquivos_estabelecimento[e]} na parte {part}"
-                    )
-                    break
-                except Exception as ex:
-                    logger.error(
-                        f"Erro ao ler arquivo {arquivos_estabelecimento[e]} na parte {part}: {str(ex)}"
-                    )
-                    break
-
-                if estabelecimento.empty:
-                    break
-
-                estabelecimento = estabelecimento.reset_index()
-                del estabelecimento["index"]
-
-                estabelecimento.columns = [
-                    "cnpj_basico",
-                    "cnpj_ordem",
-                    "cnpj_dv",
-                    "identificador_matriz_filial",
-                    "nome_fantasia",
-                    "situacao_cadastral",
-                    "data_situacao_cadastral",
-                    "motivo_situacao_cadastral",
-                    "nome_cidade_exterior",
-                    "pais",
-                    "data_inicio_atividade",
-                    "cnae_fiscal_principal",
-                    "cnae_fiscal_secundaria",
-                    "tipo_logradouro",
-                    "logradouro",
-                    "numero",
-                    "complemento",
-                    "bairro",
-                    "cep",
-                    "uf",
-                    "municipio",
-                    "ddd_1",
-                    "telefone_1",
-                    "ddd_2",
-                    "telefone_2",
-                    "ddd_fax",
-                    "fax",
-                    "correio_eletronico",
-                    "situacao_especial",
-                    "data_situacao_especial",
-                ]
-
-                await to_sql_async(estabelecimento, pool, "estabelecimento")
-                logger.info(
-                    f"Parte {part + 1} do arquivo {arquivos_estabelecimento[e]} inserida com sucesso!"
+            try:
+                reader = pd.read_csv(
+                    filepath_or_buffer=extracted_file_path,
+                    sep=";",
+                    chunksize=NROWS,
+                    header=None,
+                    dtype=estabelecimento_dtypes,
+                    encoding="latin-1",
                 )
-                progress.update(parts_task, advance=1)
+                for estabelecimento in reader:
+                    if estabelecimento.empty:
+                        continue
 
-                part += 1
-                del estabelecimento
-                gc.collect()
+                    estabelecimento = estabelecimento.reset_index(drop=True)
+
+                    estabelecimento.columns = [
+                        "cnpj_basico",
+                        "cnpj_ordem",
+                        "cnpj_dv",
+                        "identificador_matriz_filial",
+                        "nome_fantasia",
+                        "situacao_cadastral",
+                        "data_situacao_cadastral",
+                        "motivo_situacao_cadastral",
+                        "nome_cidade_exterior",
+                        "pais",
+                        "data_inicio_atividade",
+                        "cnae_fiscal_principal",
+                        "cnae_fiscal_secundaria",
+                        "tipo_logradouro",
+                        "logradouro",
+                        "numero",
+                        "complemento",
+                        "bairro",
+                        "cep",
+                        "uf",
+                        "municipio",
+                        "ddd_1",
+                        "telefone_1",
+                        "ddd_2",
+                        "telefone_2",
+                        "ddd_fax",
+                        "fax",
+                        "correio_eletronico",
+                        "situacao_especial",
+                        "data_situacao_especial",
+                    ]
+
+                    await to_sql_async(estabelecimento, pool, "estabelecimento")
+                    logger.info(
+                        f"Parte {part + 1} do arquivo {arquivos_estabelecimento[e]} inserida com sucesso!"
+                    )
+                    progress.update(parts_task, advance=1)
+
+                    part += 1
+                    del estabelecimento
+                    gc.collect()
+            except pd.errors.EmptyDataError:
+                logger.info(
+                    f"Fim do arquivo {arquivos_estabelecimento[e]} na parte {part}"
+                )
+            except Exception as ex:
+                logger.error(
+                    f"Erro ao ler arquivo {arquivos_estabelecimento[e]} na parte {part}: {str(ex)}"
+                )
 
             logger.info(
                 f"Arquivo {arquivos_estabelecimento[e]} inserido com sucesso no banco de dados!"
@@ -1393,66 +1359,56 @@ async def process_simples_files(pool):
             }
             extracted_file_path = os.path.join(extracted_files, arquivos_simples[e])
 
-            simples_lenght = sum(1 for line in open(extracted_file_path, "r"))
-            logger.info(
-                f"Linhas no arquivo do Simples {arquivos_simples[e]}: {simples_lenght}"
-            )
-
             tamanho_das_partes = 1000000  # Registros por carga
-            qtd_loops = round(simples_lenght / tamanho_das_partes, 0)
-            nrows = tamanho_das_partes
-            logger.info(f"Esse arquivo será carregado em {int(qtd_loops + 1)} partes")
 
             parts_task = progress.add_task(
-                f"Processando {arquivos_simples[e]}", total=int(qtd_loops + 1)
+                f"Processando {arquivos_simples[e]}", total=None
             )
 
-            skiprows = 0
-            for i in range(int(qtd_loops + 1)):
-                logger.debug(f"Iniciando a parte {i + 1} de {int(qtd_loops + 1)}")
-
-                try:
-                    simples = pd.read_csv(
-                        filepath_or_buffer=extracted_file_path,
-                        sep=";",
-                        nrows=nrows,
-                        skiprows=skiprows,
-                        header=None,
-                        dtype=simples_dtypes,
-                        encoding="latin-1",
-                    )
-                except pd.errors.EmptyDataError:
-                    logger.info(
-                        f"Fim do arquivo alcançado na parte {i + 1}. Encerrando processamento."
-                    )
-                    break
-
-                if simples.empty:
-                    break
-
-                simples = simples.reset_index()
-                del simples["index"]
-
-                simples.columns = [
-                    "cnpj_basico",
-                    "opcao_pelo_simples",
-                    "data_opcao_simples",
-                    "data_exclusao_simples",
-                    "opcao_mei",
-                    "data_opcao_mei",
-                    "data_exclusao_mei",
-                ]
-
-                # Gravar dados no banco usando função assíncrona
-                await to_sql_async(simples, pool, "simples")
-
-                skiprows = skiprows + nrows
-                logger.info(
-                    f"Parte {i + 1} do arquivo {arquivos_simples[e]} inserida com sucesso no banco de dados!"
+            part = 0
+            try:
+                reader = pd.read_csv(
+                    filepath_or_buffer=extracted_file_path,
+                    sep=";",
+                    chunksize=tamanho_das_partes,
+                    header=None,
+                    dtype=simples_dtypes,
+                    encoding="latin-1",
                 )
-                progress.update(parts_task, advance=1)
-                del simples
-                gc.collect()
+                for simples in reader:
+                    if simples.empty:
+                        continue
+
+                    simples = simples.reset_index(drop=True)
+
+                    simples.columns = [
+                        "cnpj_basico",
+                        "opcao_pelo_simples",
+                        "data_opcao_simples",
+                        "data_exclusao_simples",
+                        "opcao_mei",
+                        "data_opcao_mei",
+                        "data_exclusao_mei",
+                    ]
+
+                    # Gravar dados no banco usando função assíncrona
+                    await to_sql_async(simples, pool, "simples")
+
+                    part += 1
+                    logger.info(
+                        f"Parte {part} do arquivo {arquivos_simples[e]} inserida com sucesso no banco de dados!"
+                    )
+                    progress.update(parts_task, advance=1)
+                    del simples
+                    gc.collect()
+            except pd.errors.EmptyDataError:
+                logger.info(
+                    f"Fim do arquivo {arquivos_simples[e]} alcançado na parte {part}"
+                )
+            except Exception as ex:
+                logger.error(
+                    f"Erro ao ler arquivo {arquivos_simples[e]} na parte {part}: {str(ex)}"
+                )
 
             logger.info(
                 f"Arquivo {arquivos_simples[e]} inserido com sucesso no banco de dados!"
