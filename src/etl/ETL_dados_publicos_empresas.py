@@ -16,7 +16,7 @@ import zipfile
 import asyncpg
 import bs4 as bs
 import httpx
-import pandas as pd
+import polars as pl
 from dotenv import load_dotenv
 from rich.console import Console
 from rich.logging import RichHandler
@@ -95,6 +95,24 @@ def makedirs(path):
         os.makedirs(path)
 
 
+def transcode_to_utf8(path):
+    """
+    Copia um CSV latin-1 (encoding dos arquivos da Receita Federal) para um
+    arquivo irmão "<path>.utf8.csv" em UTF-8. O parser CSV do Polars só lê
+    utf8/utf8-lossy nativamente — não existe suporte a latin-1. Como latin-1
+    é 1 byte = 1 caractere, o corte em blocos abaixo nunca quebra um
+    caractere multibyte. O chamador deve remover o arquivo gerado após o uso.
+    """
+    utf8_path = f"{path}.utf8.csv"
+    with open(path, "rb") as fin, open(utf8_path, "wb") as fout:
+        while True:
+            chunk = fin.read(4 * 1024 * 1024)
+            if not chunk:
+                break
+            fout.write(chunk.decode("latin-1").encode("utf-8"))
+    return utf8_path
+
+
 CHECKPOINT_FILE = os.path.join(os.path.dirname(__file__), "..", "..", "checkpoint.json")
 
 
@@ -153,8 +171,8 @@ async def to_sql_async(dataframe, pool, table_name, batch_size=50000):
     (asyncpg.copy_records_to_table) — muito mais rápido que INSERT em lote
     para as tabelas de fato (estabelecimento, empresa, socios, simples).
     """
-    total = len(dataframe)
-    columns = list(dataframe.columns)
+    total = dataframe.height
+    columns = dataframe.columns
 
     # Definir colunas de data para cada tabela
     date_columns = {
@@ -173,16 +191,19 @@ async def to_sql_async(dataframe, pool, table_name, batch_size=50000):
     }
 
     df = dataframe
-    for col in date_columns.get(table_name, []):
-        if col in df.columns:
-            # "", "0" e "00000000" não casam com %Y%m%d e viram NaT via errors="coerce"
-            df[col] = pd.to_datetime(
-                df[col].astype(str), format="%Y%m%d", errors="coerce"
-            ).dt.date
+    date_cols_present = [c for c in date_columns.get(table_name, []) if c in df.columns]
+    if date_cols_present:
+        # "", "0" e "00000000" não casam com %Y%m%d e viram NULL com strict=False
+        df = df.with_columns(
+            [
+                pl.col(c).str.strptime(pl.Date, format="%Y%m%d", strict=False)
+                for c in date_cols_present
+            ]
+        )
 
-    # Substitui NaN/NaT/pd.NA por None (asyncpg exige None, não os sentinels do pandas)
-    df = df.astype(object).where(pd.notnull(df), None)
-    records = list(df.itertuples(index=False, name=None))
+    # df.rows() já retorna tuplas com tipos nativos do Python (str/int/float/date)
+    # e None no lugar de null — compatível direto com copy_records_to_table
+    records = df.rows()
 
     async def copy_batch(batch_records, batch_num):
         async with pool.acquire() as conn:
@@ -995,59 +1016,53 @@ async def process_empresa_files(pool):
 #######################
 """)
 
+    empresa_columns = [
+        "cnpj_basico",
+        "razao_social",
+        "natureza_juridica",
+        "qualificacao_responsavel",
+        "capital_social",
+        "porte_empresa",
+        "ente_federativo_responsavel",
+    ]
+
     for e in range(0, len(arquivos_empresa)):
         print("Trabalhando no arquivo: " + arquivos_empresa[e] + " [...]")
-        try:
-            del empresa
-        except:
-            pass
 
-        empresa_dtypes = {
-            0: object,
-            1: object,
-            2: "Int32",
-            3: "Int32",
-            4: object,
-            5: "Int32",
-            6: object,
-        }
         extracted_file_path = os.path.join(extracted_files, arquivos_empresa[e])
+        utf8_path = None
 
         try:
-            empresa = pd.read_csv(
-                filepath_or_buffer=extracted_file_path,
-                sep=";",
-                skiprows=0,
-                header=None,
-                dtype=empresa_dtypes,
-                encoding="latin-1",
+            utf8_path = transcode_to_utf8(extracted_file_path)
+            empresa = pl.read_csv(
+                utf8_path,
+                separator=";",
+                has_header=False,
+                new_columns=empresa_columns,
+                schema_overrides=[pl.Utf8] * len(empresa_columns),
+                encoding="utf8",
             )
-        except pd.errors.EmptyDataError:
+        except pl.exceptions.NoDataError:
             print(f"Arquivo {arquivos_empresa[e]} está vazio. Pulando...")
             continue
-        except Exception as e:
-            logger.error(f"Erro ao ler arquivo {arquivos_empresa[e]}: {str(e)}")
+        except Exception as ex:
+            logger.error(f"Erro ao ler arquivo {arquivos_empresa[e]}: {str(ex)}")
             continue
+        finally:
+            if utf8_path and os.path.exists(utf8_path):
+                os.remove(utf8_path)
 
-        empresa = empresa.reset_index()
-        del empresa["index"]
-
-        # Renomear colunas
-        empresa.columns = [
-            "cnpj_basico",
-            "razao_social",
-            "natureza_juridica",
-            "qualificacao_responsavel",
-            "capital_social",
-            "porte_empresa",
-            "ente_federativo_responsavel",
-        ]
-
-        # Replace "," por "."
-        empresa["capital_social"] = empresa["capital_social"].apply(
-            lambda x: x.replace(",", ".")
+        # Colunas numéricas — inválido/vazio vira NULL (strict=False), não exceção
+        empresa = empresa.with_columns(
+            [
+                pl.col("natureza_juridica").cast(pl.Int32, strict=False),
+                pl.col("qualificacao_responsavel").cast(pl.Int32, strict=False),
+                pl.col("porte_empresa").cast(pl.Int32, strict=False),
+                pl.col("capital_social")
+                .str.replace(",", ".", literal=True)
+                .cast(pl.Float64, strict=False),
+            ]
         )
-        empresa["capital_social"] = empresa["capital_social"].astype(float)
 
         # Gravar dados no banco usando função assíncrona
         await to_sql_async(empresa, pool, "empresa")
@@ -1104,45 +1119,50 @@ async def process_estabelecimento_files(pool):
         )
         progress.update(files_task, completed=start_index)
 
+        estabelecimento_columns = [
+            "cnpj_basico",
+            "cnpj_ordem",
+            "cnpj_dv",
+            "identificador_matriz_filial",
+            "nome_fantasia",
+            "situacao_cadastral",
+            "data_situacao_cadastral",
+            "motivo_situacao_cadastral",
+            "nome_cidade_exterior",
+            "pais",
+            "data_inicio_atividade",
+            "cnae_fiscal_principal",
+            "cnae_fiscal_secundaria",
+            "tipo_logradouro",
+            "logradouro",
+            "numero",
+            "complemento",
+            "bairro",
+            "cep",
+            "uf",
+            "municipio",
+            "ddd_1",
+            "telefone_1",
+            "ddd_2",
+            "telefone_2",
+            "ddd_fax",
+            "fax",
+            "correio_eletronico",
+            "situacao_especial",
+            "data_situacao_especial",
+        ]
+        estabelecimento_int32_cols = [
+            "identificador_matriz_filial",
+            "situacao_cadastral",
+            "motivo_situacao_cadastral",
+            "pais",
+            "cnae_fiscal_principal",
+            "municipio",
+        ]
+
         for e in range(start_index, len(arquivos_estabelecimento)):
             logger.info(f"Trabalhando no arquivo: {arquivos_estabelecimento[e]}")
-            try:
-                del estabelecimento
-            except:
-                pass
 
-            estabelecimento_dtypes = {
-                0: object,
-                1: object,
-                2: object,
-                3: "Int32",
-                4: object,
-                5: "Int32",
-                6: object,
-                7: "Int32",
-                8: object,
-                9: "Int32",
-                10: object,
-                11: "Int32",
-                12: object,
-                13: object,
-                14: object,
-                15: object,
-                16: object,
-                17: object,
-                18: object,
-                19: object,
-                20: "Int32",
-                21: object,
-                22: object,
-                23: object,
-                24: object,
-                25: object,
-                26: object,
-                27: object,
-                28: object,
-                29: object,
-            }
             extracted_file_path = os.path.join(
                 extracted_files, arquivos_estabelecimento[e]
             )
@@ -1152,53 +1172,28 @@ async def process_estabelecimento_files(pool):
             )
             NROWS = 2000000
             part = 0
+            utf8_path = None
             try:
-                reader = pd.read_csv(
-                    filepath_or_buffer=extracted_file_path,
-                    sep=";",
-                    chunksize=NROWS,
-                    header=None,
-                    dtype=estabelecimento_dtypes,
-                    encoding="latin-1",
+                utf8_path = transcode_to_utf8(extracted_file_path)
+                lf = pl.scan_csv(
+                    utf8_path,
+                    separator=";",
+                    has_header=False,
+                    new_columns=estabelecimento_columns,
+                    schema_overrides=[pl.Utf8] * len(estabelecimento_columns),
+                    encoding="utf8",
                 )
-                for estabelecimento in reader:
-                    if estabelecimento.empty:
+                for estabelecimento in lf.collect_batches(chunk_size=NROWS):
+                    if estabelecimento.height == 0:
                         continue
 
-                    estabelecimento = estabelecimento.reset_index(drop=True)
-
-                    estabelecimento.columns = [
-                        "cnpj_basico",
-                        "cnpj_ordem",
-                        "cnpj_dv",
-                        "identificador_matriz_filial",
-                        "nome_fantasia",
-                        "situacao_cadastral",
-                        "data_situacao_cadastral",
-                        "motivo_situacao_cadastral",
-                        "nome_cidade_exterior",
-                        "pais",
-                        "data_inicio_atividade",
-                        "cnae_fiscal_principal",
-                        "cnae_fiscal_secundaria",
-                        "tipo_logradouro",
-                        "logradouro",
-                        "numero",
-                        "complemento",
-                        "bairro",
-                        "cep",
-                        "uf",
-                        "municipio",
-                        "ddd_1",
-                        "telefone_1",
-                        "ddd_2",
-                        "telefone_2",
-                        "ddd_fax",
-                        "fax",
-                        "correio_eletronico",
-                        "situacao_especial",
-                        "data_situacao_especial",
-                    ]
+                    # Colunas numéricas — inválido/vazio vira NULL (strict=False)
+                    estabelecimento = estabelecimento.with_columns(
+                        [
+                            pl.col(c).cast(pl.Int32, strict=False)
+                            for c in estabelecimento_int32_cols
+                        ]
+                    )
 
                     await to_sql_async(estabelecimento, pool, "estabelecimento")
                     logger.info(
@@ -1209,7 +1204,7 @@ async def process_estabelecimento_files(pool):
                     part += 1
                     del estabelecimento
                     gc.collect()
-            except pd.errors.EmptyDataError:
+            except pl.exceptions.NoDataError:
                 logger.info(
                     f"Fim do arquivo {arquivos_estabelecimento[e]} na parte {part}"
                 )
@@ -1217,6 +1212,9 @@ async def process_estabelecimento_files(pool):
                 logger.error(
                     f"Erro ao ler arquivo {arquivos_estabelecimento[e]} na parte {part}: {str(ex)}"
                 )
+            finally:
+                if utf8_path and os.path.exists(utf8_path):
+                    os.remove(utf8_path)
 
             logger.info(
                 f"Arquivo {arquivos_estabelecimento[e]} inserido com sucesso no banco de dados!"
@@ -1248,61 +1246,56 @@ async def process_socios_files(pool):
 ######################
 """)
 
+    socios_columns = [
+        "cnpj_basico",
+        "identificador_socio",
+        "nome_socio",
+        "cnpj_cpf_socio",
+        "qualificacao_socio",
+        "data_entrada_sociedade",
+        "pais",
+        "representante_legal",
+        "nome_representante",
+        "qualificacao_representante_legal",
+        "faixa_etaria",
+    ]
+
     for e in range(0, len(arquivos_socios)):
         print("Trabalhando no arquivo: " + arquivos_socios[e] + " [...]")
-        try:
-            del socios
-        except:
-            pass
 
-        socios_dtypes = {
-            0: object,
-            1: "Int32",
-            2: object,
-            3: object,
-            4: "Int32",
-            5: object,
-            6: "Int32",
-            7: object,
-            8: object,
-            9: "Int32",
-            10: "Int32",
-        }
         extracted_file_path = os.path.join(extracted_files, arquivos_socios[e])
+        utf8_path = None
+
         try:
-            socios = pd.read_csv(
-                filepath_or_buffer=extracted_file_path,
-                sep=";",
-                skiprows=0,
-                header=None,
-                dtype=socios_dtypes,
-                encoding="latin-1",
+            utf8_path = transcode_to_utf8(extracted_file_path)
+            socios = pl.read_csv(
+                utf8_path,
+                separator=";",
+                has_header=False,
+                new_columns=socios_columns,
+                schema_overrides=[pl.Utf8] * len(socios_columns),
+                encoding="utf8",
             )
-        except pd.errors.EmptyDataError:
+        except pl.exceptions.NoDataError:
             print(f"Arquivo {arquivos_socios[e]} está vazio. Pulando...")
             continue
-        except Exception as e:
-            logger.error(f"Erro ao ler arquivo {arquivos_socios[e]}: {str(e)}")
+        except Exception as ex:
+            logger.error(f"Erro ao ler arquivo {arquivos_socios[e]}: {str(ex)}")
             continue
+        finally:
+            if utf8_path and os.path.exists(utf8_path):
+                os.remove(utf8_path)
 
-        # Tratamento do arquivo antes de inserir na base:
-        socios = socios.reset_index()
-        del socios["index"]
-
-        # Renomear colunas
-        socios.columns = [
-            "cnpj_basico",
-            "identificador_socio",
-            "nome_socio",
-            "cnpj_cpf_socio",
-            "qualificacao_socio",
-            "data_entrada_sociedade",
-            "pais",
-            "representante_legal",
-            "nome_representante",
-            "qualificacao_representante_legal",
-            "faixa_etaria",
-        ]
+        # Colunas numéricas — inválido/vazio vira NULL (strict=False), não exceção
+        socios = socios.with_columns(
+            [
+                pl.col("identificador_socio").cast(pl.Int32, strict=False),
+                pl.col("qualificacao_socio").cast(pl.Int32, strict=False),
+                pl.col("pais").cast(pl.Int32, strict=False),
+                pl.col("qualificacao_representante_legal").cast(pl.Int32, strict=False),
+                pl.col("faixa_etaria").cast(pl.Int32, strict=False),
+            ]
+        )
 
         # Gravar dados no banco usando função assíncrona
         await to_sql_async(socios, pool, "socios")
@@ -1345,18 +1338,19 @@ async def process_simples_files(pool):
             "Processando arquivos SIMPLES", total=len(arquivos_simples)
         )
 
+        simples_columns = [
+            "cnpj_basico",
+            "opcao_pelo_simples",
+            "data_opcao_simples",
+            "data_exclusao_simples",
+            "opcao_mei",
+            "data_opcao_mei",
+            "data_exclusao_mei",
+        ]
+
         for e in range(0, len(arquivos_simples)):
             logger.info(f"Trabalhando no arquivo: {arquivos_simples[e]}")
 
-            simples_dtypes = {
-                0: object,
-                1: object,
-                2: object,
-                3: object,
-                4: object,
-                5: object,
-                6: object,
-            }
             extracted_file_path = os.path.join(extracted_files, arquivos_simples[e])
 
             tamanho_das_partes = 1000000  # Registros por carga
@@ -1366,30 +1360,20 @@ async def process_simples_files(pool):
             )
 
             part = 0
+            utf8_path = None
             try:
-                reader = pd.read_csv(
-                    filepath_or_buffer=extracted_file_path,
-                    sep=";",
-                    chunksize=tamanho_das_partes,
-                    header=None,
-                    dtype=simples_dtypes,
-                    encoding="latin-1",
+                utf8_path = transcode_to_utf8(extracted_file_path)
+                lf = pl.scan_csv(
+                    utf8_path,
+                    separator=";",
+                    has_header=False,
+                    new_columns=simples_columns,
+                    schema_overrides=[pl.Utf8] * len(simples_columns),
+                    encoding="utf8",
                 )
-                for simples in reader:
-                    if simples.empty:
+                for simples in lf.collect_batches(chunk_size=tamanho_das_partes):
+                    if simples.height == 0:
                         continue
-
-                    simples = simples.reset_index(drop=True)
-
-                    simples.columns = [
-                        "cnpj_basico",
-                        "opcao_pelo_simples",
-                        "data_opcao_simples",
-                        "data_exclusao_simples",
-                        "opcao_mei",
-                        "data_opcao_mei",
-                        "data_exclusao_mei",
-                    ]
 
                     # Gravar dados no banco usando função assíncrona
                     await to_sql_async(simples, pool, "simples")
@@ -1401,7 +1385,7 @@ async def process_simples_files(pool):
                     progress.update(parts_task, advance=1)
                     del simples
                     gc.collect()
-            except pd.errors.EmptyDataError:
+            except pl.exceptions.NoDataError:
                 logger.info(
                     f"Fim do arquivo {arquivos_simples[e]} alcançado na parte {part}"
                 )
@@ -1409,6 +1393,9 @@ async def process_simples_files(pool):
                 logger.error(
                     f"Erro ao ler arquivo {arquivos_simples[e]} na parte {part}: {str(ex)}"
                 )
+            finally:
+                if utf8_path and os.path.exists(utf8_path):
+                    os.remove(utf8_path)
 
             logger.info(
                 f"Arquivo {arquivos_simples[e]} inserido com sucesso no banco de dados!"
@@ -1430,28 +1417,33 @@ async def process_outros_arquivos(pool):
     """
     print("Processando arquivos auxiliares (CNAE, Motivo, Municipio, etc.)")
 
+    def _read_codigo_descricao(extracted_file_path):
+        utf8_path = transcode_to_utf8(extracted_file_path)
+        try:
+            df = pl.read_csv(
+                utf8_path,
+                separator=";",
+                has_header=False,
+                new_columns=["codigo", "descricao"],
+                schema_overrides=[pl.Utf8, pl.Utf8],
+                encoding="utf8",
+            )
+        finally:
+            os.remove(utf8_path)
+        return df.with_columns(pl.col("codigo").cast(pl.Int32, strict=False))
+
     # Processar CNAE
     if arquivos_cnae:
         for e in range(0, len(arquivos_cnae)):
             extracted_file_path = os.path.join(extracted_files, arquivos_cnae[e])
             try:
-                cnae = pd.read_csv(
-                    filepath_or_buffer=extracted_file_path,
-                    sep=";",
-                    skiprows=0,
-                    header=None,
-                    dtype={0: "Int32", 1: "object"},
-                    encoding="latin-1",
-                )
-            except pd.errors.EmptyDataError:
+                cnae = _read_codigo_descricao(extracted_file_path)
+            except pl.exceptions.NoDataError:
                 print(f"Arquivo CNAE {arquivos_cnae[e]} está vazio. Pulando...")
                 continue
             except Exception as e:
                 logger.error(f"Erro ao ler arquivo CNAE {arquivos_cnae[e]}: {str(e)}")
                 continue
-            cnae = cnae.reset_index()
-            del cnae["index"]
-            cnae.columns = ["codigo", "descricao"]
             await to_sql_async(cnae, pool, "cnae")
             logger.info(f"Arquivo CNAE {arquivos_cnae[e]} inserido!")
             del cnae
@@ -1469,15 +1461,8 @@ async def process_outros_arquivos(pool):
             for e in range(0, len(arquivo_tipo)):
                 extracted_file_path = os.path.join(extracted_files, arquivo_tipo[e])
                 try:
-                    df = pd.read_csv(
-                        filepath_or_buffer=extracted_file_path,
-                        sep=";",
-                        skiprows=0,
-                        header=None,
-                        dtype={0: "Int32", 1: "object"},
-                        encoding="latin-1",
-                    )
-                except pd.errors.EmptyDataError:
+                    df = _read_codigo_descricao(extracted_file_path)
+                except pl.exceptions.NoDataError:
                     print(
                         f"Arquivo {nome_tabela} {arquivo_tipo[e]} está vazio. Pulando..."
                     )
@@ -1487,9 +1472,6 @@ async def process_outros_arquivos(pool):
                         f"Erro ao ler arquivo {nome_tabela} {arquivo_tipo[e]}: {str(e)}"
                     )
                     continue
-                df = df.reset_index()
-                del df["index"]
-                df.columns = ["codigo", "descricao"]
                 await to_sql_async(df, pool, nome_tabela)
                 logger.info(f"Arquivo {nome_tabela} {arquivo_tipo[e]} inserido!")
                 del df
@@ -1623,7 +1605,11 @@ async def create_indexes(pool):
                     )
 
                     start_time = time.time()
-                    await conn.execute(index_info["sql"])
+                    # timeout explícito: o pool tem command_timeout=300s (create_db_pool),
+                    # que sobrepõe o "SET statement_timeout" acima — sem isso, índices GIN
+                    # trgm em tabelas grandes (ex: empresa_razao_social_trgm, 69M+ linhas)
+                    # estouram o timeout do lado do cliente antes de terminar no servidor
+                    await conn.execute(index_info["sql"], timeout=3600)
                     elapsed_time = time.time() - start_time
 
                     logger.info(
