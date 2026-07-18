@@ -580,9 +580,8 @@ print("Arquivos que serão baixados:")
 for l in Files:
     print(l)
 
-# Separar arquivos por tipo
-Items = [name for name in os.listdir(extracted_files) if name.endswith("")]
-
+# Listas de arquivos por tipo — populadas em categorize_extracted_files(),
+# chamada dentro de main() DEPOIS da extração (ver nota abaixo sobre o bug corrigido)
 arquivos_empresa = []
 arquivos_estabelecimento = []
 arquivos_socios = []
@@ -594,30 +593,53 @@ arquivos_natju = []
 arquivos_pais = []
 arquivos_quals = []
 
-for i in range(0, len(Items)):
-    name_upper = Items[i].upper()
-    if "EMPRECSV" in name_upper or "EMPRESAS" in name_upper:
-        arquivos_empresa.append(Items[i])
-    elif "ESTABELE" in name_upper or "ESTABELECIMENTOS" in name_upper:
-        arquivos_estabelecimento.append(Items[i])
-    elif "SOCIOCSV" in name_upper or "SOCIOS" in name_upper:
-        arquivos_socios.append(Items[i])
-    elif "SIMPLES" in name_upper:
-        arquivos_simples.append(Items[i])
-    elif "CNAECSV" in name_upper or "CNAES" in name_upper:
-        arquivos_cnae.append(Items[i])
-    elif "MOTICSV" in name_upper or "MOTIVOS" in name_upper:
-        arquivos_moti.append(Items[i])
-    elif "MUNICCSV" in name_upper or "MUNICIPIOS" in name_upper:
-        arquivos_munic.append(Items[i])
-    elif "NATJUCSV" in name_upper or "NATUREZAS" in name_upper:
-        arquivos_natju.append(Items[i])
-    elif "PAISCSV" in name_upper or "PAISES" in name_upper:
-        arquivos_pais.append(Items[i])
-    elif "QUALSCSV" in name_upper or "QUALIFICACOES" in name_upper:
-        arquivos_quals.append(Items[i])
-    else:
-        pass
+
+def categorize_extracted_files():
+    """
+    Categoriza os arquivos de extracted_files por tipo de tabela.
+    Precisa ser chamada DEPOIS da extração (Fase 2) — chamar antes lê o
+    diretório com o conteúdo da execução anterior (ou vazio), fazendo o
+    processamento agir sobre listas vazias mesmo com a extração bem-sucedida.
+    """
+    global arquivos_empresa, arquivos_estabelecimento, arquivos_socios
+    global arquivos_simples, arquivos_cnae, arquivos_moti, arquivos_munic
+    global arquivos_natju, arquivos_pais, arquivos_quals
+
+    items = [name for name in os.listdir(extracted_files) if name.endswith("")]
+
+    arquivos_empresa = []
+    arquivos_estabelecimento = []
+    arquivos_socios = []
+    arquivos_simples = []
+    arquivos_cnae = []
+    arquivos_moti = []
+    arquivos_munic = []
+    arquivos_natju = []
+    arquivos_pais = []
+    arquivos_quals = []
+
+    for item in items:
+        name_upper = item.upper()
+        if "EMPRECSV" in name_upper or "EMPRESAS" in name_upper:
+            arquivos_empresa.append(item)
+        elif "ESTABELE" in name_upper or "ESTABELECIMENTOS" in name_upper:
+            arquivos_estabelecimento.append(item)
+        elif "SOCIOCSV" in name_upper or "SOCIOS" in name_upper:
+            arquivos_socios.append(item)
+        elif "SIMPLES" in name_upper:
+            arquivos_simples.append(item)
+        elif "CNAECSV" in name_upper or "CNAES" in name_upper:
+            arquivos_cnae.append(item)
+        elif "MOTICSV" in name_upper or "MOTIVOS" in name_upper:
+            arquivos_moti.append(item)
+        elif "MUNICCSV" in name_upper or "MUNICIPIOS" in name_upper:
+            arquivos_munic.append(item)
+        elif "NATJUCSV" in name_upper or "NATUREZAS" in name_upper:
+            arquivos_natju.append(item)
+        elif "PAISCSV" in name_upper or "PAISES" in name_upper:
+            arquivos_pais.append(item)
+        elif "QUALSCSV" in name_upper or "QUALIFICACOES" in name_upper:
+            arquivos_quals.append(item)
 
 
 @retry(stop=stop_after_attempt(5), wait=wait_exponential(multiplier=1, min=4, max=10))
@@ -1690,12 +1712,11 @@ async def main():
     logger.info("Processo ETL iniciado")
 
     try:
-        # Limpeza das pastas de trabalho antes de cada execução
-        import shutil
+        # Garante que as pastas de trabalho existem. Não limpa o conteúdo:
+        # check_diff() já reaproveita downloads cujo tamanho bate com o do
+        # servidor, então preservar o diretório evita rebaixar arquivos
+        # grandes já validados em execuções anteriores.
         for _folder in [output_files, extracted_files]:
-            if _folder and os.path.isdir(_folder):
-                shutil.rmtree(_folder)
-                logger.info(f"Pasta limpa: {_folder}")
             if _folder:
                 makedirs(_folder)
 
@@ -1720,6 +1741,19 @@ async def main():
         extract_time = time.time() - extract_start
         logger.info(f"Extração concluída em {extract_time:.1f}s")
         console.print(f"[green]✅ Extração concluída em {extract_time:.1f}s[/green]")
+
+        # Categoriza os arquivos extraídos por tipo de tabela — precisa
+        # rodar aqui, depois da extração, para não operar sobre listas vazias
+        categorize_extracted_files()
+        logger.info(
+            "Arquivos categorizados: "
+            f"empresa={len(arquivos_empresa)}, "
+            f"estabelecimento={len(arquivos_estabelecimento)}, "
+            f"socios={len(arquivos_socios)}, simples={len(arquivos_simples)}, "
+            f"cnae={len(arquivos_cnae)}, motivo={len(arquivos_moti)}, "
+            f"municipio={len(arquivos_munic)}, natureza={len(arquivos_natju)}, "
+            f"pais={len(arquivos_pais)}, qualificacao={len(arquivos_quals)}"
+        )
 
         # Fase 3: Processamento de dados
         console.print(

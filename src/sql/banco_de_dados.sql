@@ -1,11 +1,11 @@
--- Criar a base de dados "Dados_RFB"
-CREATE DATABASE "Dados_RFB"
+-- Criar a base de dados "receita_federal"
+CREATE DATABASE "receita_federal"
     WITH
     OWNER = postgres
     ENCODING = 'UTF8'
     CONNECTION LIMIT = -1;
 
-COMMENT ON DATABASE "Dados_RFB"
+COMMENT ON DATABASE "receita_federal"
     IS 'Base de dados para gravar os dados públicos de CNPJ da Receita Federal do Brasil';
 
 -- Diretório físico do banco de dados:
@@ -16,7 +16,7 @@ COMMENT ON DATABASE "Dados_RFB"
 -- ========================================
 
 -- Conectar na base de dados
-\c "Dados_RFB";
+\c "receita_federal";
 
 -- Tabela empresa
 CREATE TABLE empresa (
