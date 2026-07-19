@@ -113,6 +113,18 @@ def transcode_to_utf8(path):
     return utf8_path
 
 
+def remove_file_safe(path):
+    """
+    Remove um arquivo já carregado no banco, sem derrubar o ETL se falhar
+    (ex: permissão, arquivo já removido). Loga um aviso e segue em frente.
+    """
+    try:
+        if path and os.path.exists(path):
+            os.remove(path)
+    except OSError as e:
+        logger.warning(f"Não foi possível remover {path}: {e}")
+
+
 CHECKPOINT_FILE = os.path.join(os.path.dirname(__file__), "..", "..", "checkpoint.json")
 
 
@@ -201,18 +213,22 @@ async def to_sql_async(dataframe, pool, table_name, batch_size=50000):
             ]
         )
 
-    # df.rows() já retorna tuplas com tipos nativos do Python (str/int/float/date)
-    # e None no lugar de null — compatível direto com copy_records_to_table
-    records = df.rows()
-
-    async def copy_batch(batch_records, batch_num):
+    async def copy_batch(offset, length):
+        # Fatiar e materializar em tuplas Python só na hora de copiar ESTE batch
+        # (não a tabela inteira de uma vez) — df.slice() é uma view zero-copy
+        # sobre os buffers Arrow do Polars, e .rows() só aloca objetos Python
+        # para as `length` linhas deste batch. Antes disso era feito um único
+        # `df.rows()` sobre a tabela inteira, mantendo a tabela inteira como
+        # tuplas Python + o DataFrame original vivos ao mesmo tempo — causa
+        # confirmada (dmesg/oom-killer) de OOM em produção com tabelas grandes.
+        batch_records = df.slice(offset, length).rows()
         async with pool.acquire() as conn:
             await conn.copy_records_to_table(
                 table_name, records=batch_records, columns=columns
             )
 
         # Progress tracking
-        completed = min((batch_num + 1) * batch_size, total)
+        completed = min(offset + length, total)
         percent = (completed * 100) / total if total else 100
         progress = f"{table_name} {percent:.2f}% {completed:0{len(str(total))}}/{total}"
         sys.stdout.write(f"\r{progress}")
@@ -220,8 +236,8 @@ async def to_sql_async(dataframe, pool, table_name, batch_size=50000):
 
     # Processar em batches
     tasks = [
-        copy_batch(records[i : i + batch_size], i // batch_size)
-        for i in range(0, len(records), batch_size)
+        copy_batch(i, min(batch_size, total - i))
+        for i in range(0, total, batch_size)
     ]
 
     # Executar todos os batches em paralelo (limitando concorrência)
@@ -296,6 +312,17 @@ Exemplos de uso:
         default="receita_federal_staging",
         dest="db_target",
         help="Banco de dados destino para a carga (padrão: receita_federal_staging)",
+    )
+
+    parser.add_argument(
+        "--skip-download",
+        action="store_true",
+        dest="skip_download",
+        help=(
+            "Pula download (Fase 1) e extração (Fase 2) — usa os arquivos já "
+            "baixados/extraídos em disco e vai direto para o processamento/"
+            "inserção no banco (Fase 3). Não faz requisição à Receita Federal."
+        ),
     )
 
     return parser.parse_args()
@@ -554,23 +581,32 @@ def get_html_with_retry(url, max_retries=3):
             raise
 
 
-try:
-    all_entries = webdav_list(f"/{ano}-{mes_formatado}")
-    Files = [e for e in all_entries if e.lower().endswith(".zip")]
-except Exception as e:
-    logger.error(f"Erro fatal ao listar arquivos via WebDAV: {e}")
-    print(f"\n❌ Erro ao listar arquivos da Receita Federal via WebDAV.")
-    print(f"Diretório tentado: /{ano}-{mes_formatado}")
-    print(f"Erro: {e}")
-    print("\n🔍 Verificações:")
-    print("1. Confirme se o ano/mês estão corretos")
-    print("2. Verifique sua conexão com a internet")
-    print("3. Tente novamente em alguns minutos")
-    sys.exit(1)
+if args.skip_download:
+    # --skip-download: não faz nenhuma requisição à Receita Federal —
+    # os arquivos já baixados/extraídos em disco são usados como estão
+    Files = []
+    print(
+        "[--skip-download] Pulando listagem remota e download — "
+        "usando arquivos já extraídos em disco."
+    )
+else:
+    try:
+        all_entries = webdav_list(f"/{ano}-{mes_formatado}")
+        Files = [e for e in all_entries if e.lower().endswith(".zip")]
+    except Exception as e:
+        logger.error(f"Erro fatal ao listar arquivos via WebDAV: {e}")
+        print(f"\n❌ Erro ao listar arquivos da Receita Federal via WebDAV.")
+        print(f"Diretório tentado: /{ano}-{mes_formatado}")
+        print(f"Erro: {e}")
+        print("\n🔍 Verificações:")
+        print("1. Confirme se o ano/mês estão corretos")
+        print("2. Verifique sua conexão com a internet")
+        print("3. Tente novamente em alguns minutos")
+        sys.exit(1)
 
-print("Arquivos que serão baixados:")
-for l in Files:
-    print(l)
+    print("Arquivos que serão baixados:")
+    for l in Files:
+        print(l)
 
 # Listas de arquivos por tipo — populadas em categorize_extracted_files(),
 # chamada dentro de main() DEPOIS da extração (ver nota abaixo sobre o bug corrigido)
@@ -867,142 +903,186 @@ async def create_db_pool(db_name: str = None):
     )
 
 
-async def setup_tables(pool):
+TABLE_DDL = {
+    "empresa": """
+        CREATE TABLE empresa (
+            cnpj_basico TEXT NOT NULL,
+            razao_social TEXT,
+            natureza_juridica INTEGER,
+            qualificacao_responsavel INTEGER,
+            capital_social NUMERIC(15,2),
+            porte_empresa INTEGER,
+            ente_federativo_responsavel TEXT
+        );
+    """,
+    "estabelecimento": """
+        CREATE TABLE estabelecimento (
+            cnpj_basico TEXT NOT NULL,
+            cnpj_ordem TEXT NOT NULL,
+            cnpj_dv TEXT NOT NULL,
+            identificador_matriz_filial INTEGER,
+            nome_fantasia TEXT,
+            situacao_cadastral INTEGER,
+            data_situacao_cadastral DATE,
+            motivo_situacao_cadastral INTEGER,
+            nome_cidade_exterior TEXT,
+            pais INTEGER,
+            data_inicio_atividade DATE,
+            cnae_fiscal_principal INTEGER,
+            cnae_fiscal_secundaria TEXT,
+            tipo_logradouro TEXT,
+            logradouro TEXT,
+            numero TEXT,
+            complemento TEXT,
+            bairro TEXT,
+            cep TEXT,
+            uf TEXT,
+            municipio INTEGER,
+            ddd_1 TEXT,
+            telefone_1 TEXT,
+            ddd_2 TEXT,
+            telefone_2 TEXT,
+            ddd_fax TEXT,
+            fax TEXT,
+            correio_eletronico TEXT,
+            situacao_especial TEXT,
+            data_situacao_especial DATE
+        );
+    """,
+    "socios": """
+        CREATE TABLE socios (
+            cnpj_basico TEXT NOT NULL,
+            identificador_socio INTEGER,
+            nome_socio TEXT,
+            cnpj_cpf_socio TEXT,
+            qualificacao_socio INTEGER,
+            data_entrada_sociedade DATE,
+            pais INTEGER,
+            representante_legal TEXT,
+            nome_representante TEXT,
+            qualificacao_representante_legal INTEGER,
+            faixa_etaria INTEGER
+        );
+    """,
+    "simples": """
+        CREATE TABLE simples (
+            cnpj_basico TEXT NOT NULL,
+            opcao_pelo_simples TEXT,
+            data_opcao_simples DATE,
+            data_exclusao_simples DATE,
+            opcao_mei TEXT,
+            data_opcao_mei DATE,
+            data_exclusao_mei DATE
+        );
+    """,
+    "cnae": """
+        CREATE TABLE cnae (
+            codigo INTEGER NOT NULL PRIMARY KEY,
+            descricao TEXT
+        );
+    """,
+    "motivo": """
+        CREATE TABLE motivo (
+            codigo INTEGER NOT NULL PRIMARY KEY,
+            descricao TEXT
+        );
+    """,
+    "municipio": """
+        CREATE TABLE municipio (
+            codigo INTEGER NOT NULL PRIMARY KEY,
+            descricao TEXT
+        );
+    """,
+    "natureza": """
+        CREATE TABLE natureza (
+            codigo INTEGER NOT NULL PRIMARY KEY,
+            descricao TEXT
+        );
+    """,
+    "pais": """
+        CREATE TABLE pais (
+            codigo INTEGER NOT NULL PRIMARY KEY,
+            descricao TEXT
+        );
+    """,
+    "qualificacao": """
+        CREATE TABLE qualificacao (
+            codigo INTEGER NOT NULL PRIMARY KEY,
+            descricao TEXT
+        );
+    """,
+}
+
+
+def tables_to_preserve(checkpoint):
     """
-    Configura as tabelas necessárias
+    Retorna o conjunto de tabelas que já têm dado carregado (total ou
+    parcialmente, no caso de estabelecimento em retomada por arquivo) segundo
+    o checkpoint, e que portanto NÃO devem ser dropadas/recriadas em
+    setup_tables(). Espelha os mesmos estágios usados para pular reprocessamento
+    em main() — só preserva o que já foi efetivamente concluído.
     """
+    if not checkpoint:
+        return set()
+
+    stage = checkpoint.get("stage")
+    preserve = set()
+
+    past_empresa = (
+        "empresa_completed",
+        "estabelecimento",
+        "estabelecimento_completed",
+        "socios_completed",
+        "simples_completed",
+        "outros_completed",
+        "creating_indexes",
+    )
+    past_estabelecimento = (
+        "estabelecimento_completed",
+        "socios_completed",
+        "simples_completed",
+        "outros_completed",
+        "creating_indexes",
+    )
+    past_socios = ("socios_completed", "simples_completed", "outros_completed", "creating_indexes")
+    past_simples = ("simples_completed", "outros_completed", "creating_indexes")
+    past_outros = ("outros_completed", "creating_indexes")
+
+    if stage in past_empresa:
+        preserve.add("empresa")
+    # "estabelecimento" como stage significa retomada por arquivo — a tabela
+    # já tem dado parcial (arquivos 0..file_index-1) e não deve ser dropada
+    if stage == "estabelecimento" or stage in past_estabelecimento:
+        preserve.add("estabelecimento")
+    if stage in past_socios:
+        preserve.add("socios")
+    if stage in past_simples:
+        preserve.add("simples")
+    if stage in past_outros:
+        preserve.update({"cnae", "motivo", "municipio", "natureza", "pais", "qualificacao"})
+
+    return preserve
+
+
+async def setup_tables(pool, preserve_tables=None):
+    """
+    Configura as tabelas necessárias. Tabelas em `preserve_tables` (já
+    carregadas segundo o checkpoint) não são dropadas nem recriadas — mantém
+    os dados de uma execução anterior interrompida.
+    """
+    preserve_tables = preserve_tables or set()
+
     async with pool.acquire() as conn:
-        # Drop tables se existirem
-        await conn.execute('DROP TABLE IF EXISTS "empresa";')
-        await conn.execute('DROP TABLE IF EXISTS "estabelecimento";')
-        await conn.execute('DROP TABLE IF EXISTS "simples";')
-        await conn.execute('DROP TABLE IF EXISTS "socios";')
-        await conn.execute('DROP TABLE IF EXISTS "cnae";')
-        await conn.execute('DROP TABLE IF EXISTS "motivo";')
-        await conn.execute('DROP TABLE IF EXISTS "municipio";')
-        await conn.execute('DROP TABLE IF EXISTS "natureza";')
-        await conn.execute('DROP TABLE IF EXISTS "pais";')
-        await conn.execute('DROP TABLE IF EXISTS "qualificacao";')
+        for table_name, ddl in TABLE_DDL.items():
+            if table_name in preserve_tables:
+                logger.info(
+                    f"Tabela '{table_name}' preservada (checkpoint indica dado já carregado)"
+                )
+                continue
+            await conn.execute(f'DROP TABLE IF EXISTS "{table_name}";')
+            await conn.execute(ddl)
 
-        # Criar tabelas
-        await conn.execute("""
-            CREATE TABLE empresa (
-                cnpj_basico TEXT NOT NULL,
-                razao_social TEXT,
-                natureza_juridica INTEGER,
-                qualificacao_responsavel INTEGER,
-                capital_social NUMERIC(15,2),
-                porte_empresa INTEGER,
-                ente_federativo_responsavel TEXT
-            );
-        """)
-
-        await conn.execute("""
-            CREATE TABLE estabelecimento (
-                cnpj_basico TEXT NOT NULL,
-                cnpj_ordem TEXT NOT NULL,
-                cnpj_dv TEXT NOT NULL,
-                identificador_matriz_filial INTEGER,
-                nome_fantasia TEXT,
-                situacao_cadastral INTEGER,
-                data_situacao_cadastral DATE,
-                motivo_situacao_cadastral INTEGER,
-                nome_cidade_exterior TEXT,
-                pais INTEGER,
-                data_inicio_atividade DATE,
-                cnae_fiscal_principal INTEGER,
-                cnae_fiscal_secundaria TEXT,
-                tipo_logradouro TEXT,
-                logradouro TEXT,
-                numero TEXT,
-                complemento TEXT,
-                bairro TEXT,
-                cep TEXT,
-                uf TEXT,
-                municipio INTEGER,
-                ddd_1 TEXT,
-                telefone_1 TEXT,
-                ddd_2 TEXT,
-                telefone_2 TEXT,
-                ddd_fax TEXT,
-                fax TEXT,
-                correio_eletronico TEXT,
-                situacao_especial TEXT,
-                data_situacao_especial DATE
-            );
-        """)
-
-        await conn.execute("""
-            CREATE TABLE socios (
-                cnpj_basico TEXT NOT NULL,
-                identificador_socio INTEGER,
-                nome_socio TEXT,
-                cnpj_cpf_socio TEXT,
-                qualificacao_socio INTEGER,
-                data_entrada_sociedade DATE,
-                pais INTEGER,
-                representante_legal TEXT,
-                nome_representante TEXT,
-                qualificacao_representante_legal INTEGER,
-                faixa_etaria INTEGER
-            );
-        """)
-
-        await conn.execute("""
-            CREATE TABLE simples (
-                cnpj_basico TEXT NOT NULL,
-                opcao_pelo_simples TEXT,
-                data_opcao_simples DATE,
-                data_exclusao_simples DATE,
-                opcao_mei TEXT,
-                data_opcao_mei DATE,
-                data_exclusao_mei DATE
-            );
-        """)
-
-        await conn.execute("""
-            CREATE TABLE cnae (
-                codigo INTEGER NOT NULL PRIMARY KEY,
-                descricao TEXT
-            );
-        """)
-
-        await conn.execute("""
-            CREATE TABLE motivo (
-                codigo INTEGER NOT NULL PRIMARY KEY,
-                descricao TEXT
-            );
-        """)
-
-        await conn.execute("""
-            CREATE TABLE municipio (
-                codigo INTEGER NOT NULL PRIMARY KEY,
-                descricao TEXT
-            );
-        """)
-
-        await conn.execute("""
-            CREATE TABLE natureza (
-                codigo INTEGER NOT NULL PRIMARY KEY,
-                descricao TEXT
-            );
-        """)
-
-        await conn.execute("""
-            CREATE TABLE pais (
-                codigo INTEGER NOT NULL PRIMARY KEY,
-                descricao TEXT
-            );
-        """)
-
-        await conn.execute("""
-            CREATE TABLE qualificacao (
-                codigo INTEGER NOT NULL PRIMARY KEY,
-                descricao TEXT
-            );
-        """)
-
-        print("Tabelas criadas com sucesso!")
+        print("Tabelas configuradas com sucesso!")
 
 
 async def process_empresa_files(pool):
@@ -1069,6 +1149,9 @@ async def process_empresa_files(pool):
         logger.info(
             f"Arquivo {arquivos_empresa[e]} inserido com sucesso no banco de dados!"
         )
+
+        # Já carregado no banco — libera espaço em disco
+        remove_file_safe(extracted_file_path)
 
         # Liberar memória explicitamente
         del empresa
@@ -1225,6 +1308,9 @@ async def process_estabelecimento_files(pool):
             # Salvar checkpoint após cada arquivo processado
             save_checkpoint("estabelecimento", e + 1)
 
+            # Já carregado no banco — libera espaço em disco
+            remove_file_safe(extracted_file_path)
+
     logger.info("Arquivos de estabelecimento finalizados!")
     estabelecimento_insert_end = time.time()
     estabelecimento_Tempo_insert = round(
@@ -1302,6 +1388,9 @@ async def process_socios_files(pool):
         logger.info(
             f"Arquivo {arquivos_socios[e]} inserido com sucesso no banco de dados!"
         )
+
+        # Já carregado no banco — libera espaço em disco
+        remove_file_safe(extracted_file_path)
 
         del socios
         gc.collect()
@@ -1403,6 +1492,9 @@ async def process_simples_files(pool):
             progress.update(files_task, advance=1)
             progress.remove_task(parts_task)
 
+            # Já carregado no banco — libera espaço em disco
+            remove_file_safe(extracted_file_path)
+
     logger.info("Arquivos do Simples Nacional finalizados!")
     simples_insert_end = time.time()
     simples_Tempo_insert = round((simples_insert_end - simples_insert_start))
@@ -1446,6 +1538,7 @@ async def process_outros_arquivos(pool):
                 continue
             await to_sql_async(cnae, pool, "cnae")
             logger.info(f"Arquivo CNAE {arquivos_cnae[e]} inserido!")
+            remove_file_safe(extracted_file_path)
             del cnae
             gc.collect()
 
@@ -1474,6 +1567,7 @@ async def process_outros_arquivos(pool):
                     continue
                 await to_sql_async(df, pool, nome_tabela)
                 logger.info(f"Arquivo {nome_tabela} {arquivo_tipo[e]} inserido!")
+                remove_file_safe(extracted_file_path)
                 del df
                 gc.collect()
 
@@ -1662,27 +1756,36 @@ async def main():
             if _folder:
                 makedirs(_folder)
 
-        # Fase 1: Download paralelo
-        console.print(
-            "\n[bold yellow]📥 [FASE 1] Download dos arquivos...[/bold yellow]"
-        )
-        download_start = time.time()
-        await download_all_files()
-        download_time = time.time() - download_start
-        logger.info(f"Download concluído em {download_time:.1f}s")
-        console.print(f"[green]✅ Download concluído em {download_time:.1f}s[/green]")
+        if args.skip_download:
+            console.print(
+                "\n[bold yellow]⏭  [FASE 1+2] Puladas (--skip-download) — "
+                "usando arquivos já baixados/extraídos em disco[/bold yellow]"
+            )
+            download_time = 0.0
+            extract_time = 0.0
+            state.update_staging_downloaded(source_month=f"{mes:02d}-{ano}")
+        else:
+            # Fase 1: Download paralelo
+            console.print(
+                "\n[bold yellow]📥 [FASE 1] Download dos arquivos...[/bold yellow]"
+            )
+            download_start = time.time()
+            await download_all_files()
+            download_time = time.time() - download_start
+            logger.info(f"Download concluído em {download_time:.1f}s")
+            console.print(f"[green]✅ Download concluído em {download_time:.1f}s[/green]")
 
-        state.update_staging_downloaded(source_month=f"{mes:02d}-{ano}")
+            state.update_staging_downloaded(source_month=f"{mes:02d}-{ano}")
 
-        # Fase 2: Extração paralela
-        console.print(
-            "\n[bold yellow]📂 [FASE 2] Extração dos arquivos...[/bold yellow]"
-        )
-        extract_start = time.time()
-        await extract_all_files()
-        extract_time = time.time() - extract_start
-        logger.info(f"Extração concluída em {extract_time:.1f}s")
-        console.print(f"[green]✅ Extração concluída em {extract_time:.1f}s[/green]")
+            # Fase 2: Extração paralela
+            console.print(
+                "\n[bold yellow]📂 [FASE 2] Extração dos arquivos...[/bold yellow]"
+            )
+            extract_start = time.time()
+            await extract_all_files()
+            extract_time = time.time() - extract_start
+            logger.info(f"Extração concluída em {extract_time:.1f}s")
+            console.print(f"[green]✅ Extração concluída em {extract_time:.1f}s[/green]")
 
         # Categoriza os arquivos extraídos por tipo de tabela — precisa
         # rodar aqui, depois da extração, para não operar sobre listas vazias
@@ -1710,11 +1813,20 @@ async def main():
         pool = await create_db_pool(db_name=db_target)
 
         try:
-            # Configurar tabelas
-            await setup_tables(pool)
-
-            # Processar todos os tipos de arquivo
+            # Checkpoint precisa ser lido ANTES de configurar as tabelas: se uma
+            # execução anterior já carregou algumas tabelas com sucesso, elas
+            # não devem ser dropadas/recriadas aqui (setup_tables preserva o
+            # que já está pronto)
             checkpoint = load_checkpoint()
+            preserve = tables_to_preserve(checkpoint)
+            if preserve:
+                console.print(
+                    f"[yellow]Retomando checkpoint — preservando tabelas já carregadas: "
+                    f"{', '.join(sorted(preserve))}[/yellow]"
+                )
+
+            # Configurar tabelas
+            await setup_tables(pool, preserve_tables=preserve)
 
             # Verificar qual etapa retomar
             if not checkpoint or checkpoint["stage"] == "empresa":
@@ -1751,7 +1863,28 @@ async def main():
                 await process_simples_files(pool)
                 save_checkpoint("simples_completed")
 
-            await process_outros_arquivos(pool)
+            if not checkpoint or checkpoint["stage"] in [
+                "empresa",
+                "empresa_completed",
+                "estabelecimento",
+                "estabelecimento_completed",
+                "socios",
+                "socios_completed",
+                "simples",
+                "simples_completed",
+            ]:
+                await process_outros_arquivos(pool)
+                save_checkpoint("outros_completed")
+
+            # Todos os dados já foram carregados no banco — os ZIPs baixados não
+            # servem mais nesta execução (não ajudam numa reexecução futura, já
+            # que o dataset da Receita Federal muda todo mês)
+            console.print(
+                "\n[bold yellow]🧹 Limpando arquivos ZIP já processados...[/bold yellow]"
+            )
+            for _name in os.listdir(output_files):
+                if _name.lower().endswith(".zip"):
+                    remove_file_safe(os.path.join(output_files, _name))
 
             # Criar índices automaticamente
             save_checkpoint("creating_indexes")

@@ -136,6 +136,7 @@ arquivo (`file_index`), não por chunk interno. A skip logic em `process_estabel
 | Transcodificação adiciona I/O extra | Streaming em blocos de 4MB, custo dominado por throughput de disco — esperado marginal frente ao parser Rust do Polars |
 | Disco cheio por arquivos `.utf8.csv` temporários | Remover cada `.utf8.csv` em `finally` logo após consumir os batches daquele arquivo |
 | Regressão silenciosa em dado real (sem testes automatizados) | Verificação manual: rodar ETL completo contra Postgres local (docker) com uma amostra real, comparar contagens de linha por tabela e inspecionar amostra com acentuação (query direta) |
+| **[Confirmado em produção 2026-07-19]** OOM: `to_sql_async` fazia `df.rows()` sobre a tabela/chunk inteira antes de dividir em batches, mantendo DataFrame original + transformado + lista de tuplas Python vivos ao mesmo tempo — servidor de 7.6GB de RAM (Hetzner CX33) matou o processo 3x (`dmesg`/oom-killer, `python3` com ~7.3GB RSS) | Corrigido: cada `copy_batch` agora faz `df.slice(offset, length).rows()` (fatia zero-copy do Polars, materializa só o batch atual em tuplas Python). Pico de memória cai de O(linhas da tabela) para O(batch_size × conexões simultâneas). Validado com teste funcional (8 linhas, batch_size=3, múltiplos batches) contra Postgres real |
 
 ---
 
