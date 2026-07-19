@@ -86,6 +86,18 @@ def parse_args() -> argparse.Namespace:
         help="Pula o ETL — assume que staging já foi carregada",
     )
     parser.add_argument(
+        "--skip-download",
+        action="store_true",
+        dest="skip_download",
+        help=(
+            "Repassa --skip-download para o ETL — pula download e extração, "
+            "usa os arquivos já baixados/extraídos em disco e vai direto para "
+            "o processamento/inserção no banco. Recomendado informar o mês "
+            "explicitamente (ex: 07-2026) para não fazer nenhuma chamada de "
+            "rede à Receita Federal."
+        ),
+    )
+    parser.add_argument(
         "--auto-switch",
         action="store_true",
         help="Executa o switch sem pedir confirmação interativa",
@@ -112,6 +124,9 @@ def run_etl(args: argparse.Namespace) -> bool:
         cmd.append("--last")
     else:
         cmd.append("--last")
+
+    if args.skip_download:
+        cmd.append("--skip-download")
 
     console.print(f"[dim]Comando: {' '.join(cmd)}[/dim]\n")
 
@@ -200,10 +215,11 @@ async def main_async(args: argparse.Namespace) -> int:
     if args.dry_run:
         total_steps -= 1
 
+    etl_status = "pulado" if args.skip_etl else ("sem download" if args.skip_download else "ativo")
     console.print(Panel(
         "[bold]Deploy blue-green — Receita Federal CNPJ[/bold]\n"
         f"Modo: {'dry-run' if args.dry_run else 'completo'} | "
-        f"ETL: {'pulado' if args.skip_etl else 'ativo'} | "
+        f"ETL: {etl_status} | "
         f"Switch: {'automático' if args.auto_switch else 'confirmar'}",
         border_style="magenta",
     ))
