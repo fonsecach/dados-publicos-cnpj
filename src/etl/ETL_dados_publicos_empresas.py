@@ -855,7 +855,17 @@ async def create_database_if_not_exists(db_name: str = None):
 
         if not exists:
             console.print(f"[yellow]Criando banco de dados: {database}[/yellow]")
-            await conn.execute(f'CREATE DATABASE "{database}"')
+            # Bancos de staging (transitórios) podem ir para um tablespace em disco
+            # separado (ex.: volume), mantendo o banco principal no disco principal.
+            # Definido via STAGING_TABLESPACE; aplicado apenas a bancos "*_staging".
+            tablespace = os.getenv("STAGING_TABLESPACE", "").strip()
+            ts_clause = ""
+            if tablespace and database.endswith("_staging"):
+                ts_clause = f' TABLESPACE "{tablespace}"'
+                console.print(
+                    f"[dim]  → tablespace '{tablespace}' (disco separado)[/dim]"
+                )
+            await conn.execute(f'CREATE DATABASE "{database}"{ts_clause}')
             console.print(
                 f"[green]✅ Banco de dados '{database}' criado com sucesso![/green]"
             )

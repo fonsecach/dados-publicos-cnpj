@@ -21,6 +21,7 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
+import asyncpg
 from dotenv import load_dotenv
 from rich.console import Console
 from rich.panel import Panel
@@ -107,6 +108,17 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Executa ETL e validação mas não faz o switch",
     )
+    parser.add_argument(
+        "--relocate-to-main",
+        action="store_true",
+        help=(
+            "Após o switch, move 'receita_federal' para o tablespace pg_default "
+            "(disco principal). Use quando a staging foi criada em um tablespace de "
+            "volume (STAGING_TABLESPACE) e você quer o banco principal no disco "
+            "principal, liberando o volume para o próximo ciclo. Encerra as conexões "
+            "ativas e copia os dados — leva alguns minutos."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -183,6 +195,33 @@ async def run_switch() -> bool:
     switcher = BlueGreenSwitcher(config, sm)
     result = await switcher.switch(force=True)  # validação já foi feita no passo 2
     return result.success, result
+
+
+async def relocate_to_main() -> tuple[bool, str]:
+    """Move 'receita_federal' para o tablespace pg_default (disco principal).
+
+    Necessário quando a staging foi criada em tablespace de volume: após o switch
+    (rename), o banco ativo fica fisicamente no volume. Este passo o traz de volta
+    ao disco principal e libera o volume. Exige encerrar conexões ativas.
+    """
+    config = _build_db_config()
+    admin = await asyncpg.connect(**config, database="postgres", timeout=30)
+    try:
+        await admin.execute(
+            """
+            SELECT pg_terminate_backend(pid)
+            FROM pg_stat_activity
+            WHERE datname = 'receita_federal' AND pid <> pg_backend_pid()
+            """
+        )
+        await admin.execute(
+            'ALTER DATABASE "receita_federal" SET TABLESPACE pg_default'
+        )
+        return True, "receita_federal movido para pg_default (disco principal)"
+    except Exception as e:  # noqa: BLE001
+        return False, f"Falha ao relocar para pg_default: {e}"
+    finally:
+        await admin.close()
 
 
 # ---------------------------------------------------------------------------
@@ -287,6 +326,15 @@ async def main_async(args: argparse.Namespace) -> int:
         return 1
 
     _ok(switch_result.message)
+
+    # Reloca o banco ativo para o disco principal (libera o volume da staging)
+    if args.relocate_to_main:
+        console.print("\n[dim]Movendo receita_federal para o disco principal (pg_default)...[/dim]")
+        ok_reloc, msg = await relocate_to_main()
+        if ok_reloc:
+            _ok(msg)
+        else:
+            _warn(msg)  # switch já foi feito; a relocação é best-effort
 
     sm = StateManager()
     print_summary(sm, start, success=True)
