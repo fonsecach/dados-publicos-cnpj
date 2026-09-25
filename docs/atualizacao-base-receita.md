@@ -27,7 +27,7 @@ sudo chown postgres:postgres /mnt/pg_staging
 sudo -u postgres psql -c "CREATE TABLESPACE staging LOCATION '/mnt/pg_staging';"
 
 # diretório de trabalho do ETL no volume (dono = usuário que roda o ETL)
-sudo mkdir -p /mnt/pg_staging/etl/{downloads,tmp}
+sudo mkdir -p /mnt/pg_staging/etl/{downloads,extracted}
 sudo chown -R $USER:$USER /mnt/pg_staging/etl
 ```
 
@@ -35,10 +35,13 @@ sudo chown -R $USER:$USER /mnt/pg_staging/etl
 
 ### `.env`
 ```
-DOWNLOAD_DIR=/mnt/pg_staging/etl/downloads   # ZIPs da Receita -> volume
-TEMP_DIR=/mnt/pg_staging/etl/tmp             # extração/processamento -> volume
-STAGING_TABLESPACE=staging                   # staging criada no volume
+# O ETL lê estas duas (NÃO DOWNLOAD_DIR/TEMP_DIR):
+OUTPUT_FILES_PATH=/mnt/pg_staging/etl/downloads     # ZIPs da Receita -> volume
+EXTRACTED_FILES_PATH=/mnt/pg_staging/etl/extracted  # CSVs extraídos -> volume
+STAGING_TABLESPACE=staging                          # staging criada no volume
 ```
+O log inicial do ETL imprime `output_files:` / `extracted_files:` — confirme que
+apontam para `/mnt/pg_staging/...` antes de deixar baixar.
 
 ### Temporários do Postgres no volume
 Sorts, hash joins e tabelas temporárias (inclui builds de índice) vão para o volume:

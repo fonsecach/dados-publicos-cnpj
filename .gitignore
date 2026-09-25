@@ -152,3 +152,5 @@ extracted/
 
 # Database dumps
 *.sql
+*.dump
+dumps/

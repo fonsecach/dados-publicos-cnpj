@@ -63,6 +63,22 @@ class StateManager:
         state["last_switch"] = now
         self._write(state)
 
+    def promote_from_dump(self, source_month: str) -> None:
+        """Marca deploy via dump/restore como ativo (sem passar por staging)."""
+        now = _now_iso()
+        state = self.read()
+        state["active"] = {
+            "database": "receita_federal",
+            "source_month": source_month,
+            "downloaded_at": None,
+            "processed_at": now,
+            "switched_at": now,
+            "deploy_method": "dump_restore",
+        }
+        state["staging"] = None
+        state["last_switch"] = now
+        self._write(state)
+
     def get_active(self) -> dict | None:
         return self.read().get("active")
 
