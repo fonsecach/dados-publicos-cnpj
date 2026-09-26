@@ -1,10 +1,11 @@
 {
-  "active": null,
-  "staging": {
-    "database": "receita_federal_staging",
-    "source_month": "07-2026",
-    "downloaded_at": "2026-07-18T21:50:35+00:00",
-    "processed_at": "2026-07-18T22:12:45+00:00"
+  "active": {
+    "database": "receita_federal",
+    "source_month": "09-2026",
+    "downloaded_at": "2026-09-25T21:15:58+00:00",
+    "processed_at": "2026-09-25T22:17:55+00:00",
+    "switched_at": "2026-09-25T22:20:14+00:00"
   },
-  "last_switch": null
+  "staging": null,
+  "last_switch": "2026-09-25T22:20:14+00:00"
 }
