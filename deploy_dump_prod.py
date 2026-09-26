@@ -59,7 +59,13 @@ def _build_db_config(database: str = "postgres") -> dict:
         "user": os.getenv("DB_USER", "postgres"),
         "password": os.getenv("DB_PASSWORD", ""),
         "database": database,
+        "ssl_mode": os.getenv("DB_SSL_MODE", "disable"),
     }
+
+
+def _psql_cfg(database: str = "postgres") -> dict:
+    cfg = _build_db_config(database)
+    return {k: cfg[k] for k in ("host", "port", "user", "database")}
 
 
 def _pg_env() -> dict:
@@ -69,7 +75,7 @@ def _pg_env() -> dict:
 
 
 def _run_psql(sql: str, database: str = "postgres") -> None:
-    cfg = _build_db_config(database)
+    cfg = _psql_cfg(database)
     cmd = [
         "psql",
         "-h",
@@ -122,8 +128,33 @@ def _terminate_connections(*db_names: str) -> None:
     )
 
 
+def _psql_scalar(sql: str, database: str = "postgres") -> str:
+    cfg = _psql_cfg(database)
+    result = subprocess.run(
+        [
+            "psql",
+            "-h",
+            cfg["host"],
+            "-p",
+            str(cfg["port"]),
+            "-U",
+            cfg["user"],
+            "-d",
+            database,
+            "-tAc",
+            sql,
+        ],
+        env=_pg_env(),
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr.strip() or result.stdout.strip())
+    return result.stdout.strip()
+
+
 def _database_exists(name: str) -> bool:
-    cfg = _build_db_config("postgres")
+    cfg = _psql_cfg("postgres")
     result = subprocess.run(
         [
             "psql",
@@ -211,11 +242,60 @@ def _restore_dump(dump_path: Path, jobs: int) -> None:
         raise RuntimeError(f"pg_restore falhou com código {result.returncode}")
 
 
-async def _validate_active() -> tuple[bool, object]:
-    config = _build_db_config()
+async def _validate_active_async() -> tuple[bool, object]:
+    config = {k: v for k, v in _build_db_config().items() if k != "database"}
     validator = BlueGreenValidator(config)
     result = await validator.validate(_ACTIVE_DB)
     return result.is_valid, result
+
+
+def _validate_active_psql() -> tuple[bool, object]:
+    """Validação via psql — mesmo caminho usado pelo pg_restore."""
+    from src.blue_green.constants import EXPECTED_INDEXES, EXPECTED_TABLES
+    from src.blue_green.validator import ValidationResult
+
+    missing_tables = []
+    empty_tables = []
+    for table in EXPECTED_TABLES:
+        exists = _psql_scalar(
+            f"SELECT EXISTS(SELECT 1 FROM information_schema.tables "
+            f"WHERE table_schema='public' AND table_name='{table}')",
+            _ACTIVE_DB,
+        )
+        if exists != "t":
+            missing_tables.append(table)
+            continue
+        count = int(_psql_scalar(f"SELECT COUNT(*) FROM {table}", _ACTIVE_DB))
+        if count == 0:
+            empty_tables.append(table)
+
+    missing_indexes = []
+    for index in EXPECTED_INDEXES:
+        exists = _psql_scalar(
+            f"SELECT EXISTS(SELECT 1 FROM pg_indexes WHERE indexname='{index}')",
+            _ACTIVE_DB,
+        )
+        if exists != "t":
+            missing_indexes.append(index)
+
+    result = ValidationResult(
+        is_valid=not missing_tables and not empty_tables and not missing_indexes,
+        missing_tables=missing_tables,
+        empty_tables=empty_tables,
+        missing_indexes=missing_indexes,
+    )
+    return result.is_valid, result
+
+
+def _validate_active() -> tuple[bool, object]:
+    is_valid, result = asyncio.run(_validate_active_async())
+    if result.connection_error:
+        console.print(
+            f"[yellow]⚠ asyncpg falhou ({result.connection_error}) — "
+            "validando via psql...[/yellow]"
+        )
+        return _validate_active_psql()
+    return is_valid, result
 
 
 def _print_validation(result) -> None:
@@ -223,6 +303,8 @@ def _print_validation(result) -> None:
     t.add_column("Verificação")
     t.add_column("Status")
     t.add_column("Detalhes")
+    if result.connection_error:
+        t.add_row("Conexão", "[red]FALHOU[/red]", result.connection_error)
     t.add_row(
         "Tabelas existentes",
         "[green]OK[/green]" if not result.missing_tables else "[red]FALHOU[/red]",
@@ -304,6 +386,15 @@ def parse_args() -> argparse.Namespace:
             "Use antes de enviar o .dump via rsync."
         ),
     )
+    parser.add_argument(
+        "--finalize",
+        action="store_true",
+        help=(
+            "Pula restore — só valida o banco já restaurado, atualiza "
+            "blue_green_state.json e sobe a API. Use se pg_restore terminou "
+            "mas a validação falhou."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -346,6 +437,32 @@ def _prepare_disk(args: argparse.Namespace) -> None:
 def main() -> None:
     args = parse_args()
     dump_path = args.dump if args.dump.is_absolute() else _ROOT / args.dump
+
+    if args.finalize:
+        if not args.source_month:
+            console.print("[red]❌ --source-month é obrigatório com --finalize[/red]")
+            sys.exit(1)
+        try:
+            if not os.getenv("DB_PASSWORD"):
+                raise RuntimeError("DB_PASSWORD não definido no .env")
+            if not _database_exists(_ACTIVE_DB):
+                raise RuntimeError(f"Banco {_ACTIVE_DB} não existe")
+        except RuntimeError as e:
+            console.print(f"[red]❌ {e}[/red]")
+            sys.exit(1)
+
+        console.print(Panel("[bold]Finalize — validar banco já restaurado[/bold]", border_style="cyan"))
+        is_valid, result = _validate_active()
+        _print_validation(result)
+        if not is_valid:
+            console.print(f"[red]❌ {result.summary}[/red]")
+            sys.exit(1)
+        StateManager().promote_from_dump(args.source_month)
+        console.print("[green]✅ blue_green_state.json atualizado[/green]")
+        if not args.skip_api_stop and _api_service():
+            _service_ctl("start")
+        console.print("[bold green]✅ Deploy finalizado[/bold green]")
+        sys.exit(0)
 
     if args.prepare_only:
         try:
@@ -431,7 +548,7 @@ def main() -> None:
         _restore_dump(dump_path, args.jobs)
 
         console.print(Rule("[bold cyan]4/5 — Validar[/bold cyan]"))
-        is_valid, result = asyncio.run(_validate_active())
+        is_valid, result = _validate_active()
         _print_validation(result)
         if not is_valid:
             raise RuntimeError(f"Banco inválido após restore: {result.summary}")

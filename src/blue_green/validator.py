@@ -10,11 +10,14 @@ class ValidationResult:
     missing_tables: list = field(default_factory=list)
     empty_tables: list = field(default_factory=list)
     missing_indexes: list = field(default_factory=list)
+    connection_error: str | None = None
 
     @property
     def summary(self) -> str:
         if self.is_valid:
             return "VALID — staging pronta para switch"
+        if self.connection_error:
+            return f"INVALID — falha de conexão: {self.connection_error}"
         issues = []
         if self.missing_tables:
             issues.append(f"Tabelas ausentes: {', '.join(self.missing_tables)}")
@@ -25,18 +28,32 @@ class ValidationResult:
         return "INVALID — " + "; ".join(issues)
 
 
+def _asyncpg_ssl(mode: str | None):
+    if not mode or mode.lower() in ("disable", "false"):
+        return False
+    if mode.lower() in ("require", "true"):
+        return True
+    return "prefer"
+
+
 class BlueGreenValidator:
-    def __init__(self, db_config: dict):
+    def __init__(self, db_config: dict, ssl_mode: str | None = None):
         self._config = db_config
+        self._ssl_mode = ssl_mode
 
     async def validate(self, db_name: str = "receita_federal_staging") -> ValidationResult:
+        ssl = _asyncpg_ssl(self._ssl_mode or self._config.get("ssl_mode"))
         try:
-            conn = await asyncpg.connect(**self._config, database=db_name, timeout=30)
+            conn = await asyncpg.connect(
+                **self._config,
+                database=db_name,
+                ssl=ssl,
+                timeout=60,
+            )
         except Exception as e:
             return ValidationResult(
                 is_valid=False,
-                missing_tables=EXPECTED_TABLES[:],
-                missing_indexes=EXPECTED_INDEXES[:],
+                connection_error=str(e),
             )
 
         try:
